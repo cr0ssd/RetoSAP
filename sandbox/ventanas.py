@@ -1,0 +1,354 @@
+"""
+ventanas.py - Generación de ventanas sobre SAP HANA (solo generación, sin diagnóstico).
+
+Ventanas de 5 min con paso de 2.5 min: cada log cae en 2 ventanas consecutivas y se
+descartan las ventanas parciales de los bordes del batch. Todo se calcula en HANA con SQL;
+solo se descarga al cliente la tabla final de ventanas (unas ~4,000 filas por semana).
+
+Flujo (un batch = una semana, ya filtrada en un DataFrame de hana_ml):
+
+    import ventanas
+    ventanas.drop_temp(conn)                                    # limpia temporales previos
+    win = ventanas.build_system_windows(conn, system_weeks[0], df_system)
+    df_win = win.collect()                                      # o win.save('WIN_SYSTEM_W0')
+
+Decisiones de diseño:
+  * js_* comparan cada ventana contra la distribución de SU PROPIO batch (semana).
+  * novel_ips / novel_paths usan el historial completo (df_history): la primera aparición
+    y el calentamiento de 24 h se miden desde el inicio de todos los datos, no del batch.
+  * Los eventos expandidos se materializan en una tabla temporal local (#EV_SYSTEM / #EV_LLM);
+    el DataFrame devuelto la referencia, así que debe consumirse (collect/save) antes de
+    procesar la siguiente semana, que la reemplaza.
+Los nombres de columna de salida van en MAYÚSCULAS (convención de HANA).
+"""
+
+WINDOW_SIZE_S = 300          # 5 min
+WINDOW_STEP_S = 150          # 2.5 min
+WARMUP_S = 24 * 3600         # calentamiento para novel_*
+
+# Columnas categóricas con las que se calcula js_* (system).
+CATEGORICAL_COLS_SYSTEM = [
+    'HTTP_STATUS_CODE', 'HEADERS_HTTP_REQUEST_METHOD', 'SAP_FUNCTION_LOG_TYPE',
+    'HEATHERS_REQUEST_PATH', 'SAP_FUNCTION_APPLICATION', 'SAP_SOURCE_TYPE',
+    'SAP_APP_ENV', 'REGION_CODE', 'HEADERS_HTTP_HOST', 'HEADERS_CONTENT_TYPE',
+]
+
+_EPOCH = "TO_TIMESTAMP('1970-01-01 00:00:00', 'YYYY-MM-DD HH24:MI:SS')"
+_TS_FMT = "'YYYY-MM-DD HH24:MI:SS.FF3'"
+SYSTEM_EVENTS_TABLE = '#EV_SYSTEM'
+LLM_EVENTS_TABLE = '#EV_LLM'
+
+
+# --------------------------------------------------------------------------
+# Utilidades SQL
+# --------------------------------------------------------------------------
+def _q(name):
+    return '"%s"' % name
+
+
+def _ts(col):
+    """Texto ISO ('2026-10-01T00:10:20.000Z') -> TIMESTAMP. Nulo o vacío -> NULL."""
+    c = _q(col)
+    return ("CASE WHEN %s IS NULL OR %s = '' THEN NULL ELSE "
+            "TO_TIMESTAMP(REPLACE(REPLACE(%s,'T',' '),'Z',''), %s) END" % (c, c, c, _TS_FMT))
+
+
+def _num(col):
+    """Texto o número -> DOUBLE; lo que no sea numérico -> NULL (como to_numeric coerce)."""
+    s = "TO_NVARCHAR(%s)" % _q(col)
+    return ("CASE WHEN %s LIKE_REGEXPR '^[-+]?[0-9]*[.]?[0-9]+([eE][-+]?[0-9]+)?$' THEN TO_DOUBLE(%s) END" % (s, s))
+
+
+def _floor_step(col):
+    return ("ADD_SECONDS(%s, FLOOR(SECONDS_BETWEEN(%s, %s) / %d.0) * %d)"
+            % (_EPOCH, _EPOCH, col, WINDOW_STEP_S, WINDOW_STEP_S))
+
+
+def _run(conn, sql):
+    """Ejecuta DDL levantando el error (execute_sql de hana_ml solo lo registra)."""
+    with conn.connection.cursor() as cur:
+        cur.execute(sql)
+    if not conn.connection.getautocommit():
+        conn.connection.commit()
+
+
+def drop_temp(conn, table=SYSTEM_EVENTS_TABLE):
+    """Borra la tabla temporal de eventos si existe."""
+    try:
+        _run(conn, 'DROP TABLE %s' % _q(table))
+    except Exception:
+        pass
+
+
+# --------------------------------------------------------------------------
+# 1) Expansión a ventanas solapadas (equivale a expand_to_windows)
+# --------------------------------------------------------------------------
+def _expand_sql(l1):
+    """
+    `l1` debe traer TS y WS0 (inicio de la ventana base de 2.5 min).
+    Duplica cada fila (WS = WS0 y WS = WS0 - 2.5 min) y conserva solo las ventanas
+    completas: [WS, WS + 5 min) dentro del rango observado del batch.
+    """
+    return (
+        'SELECT e.* FROM ('
+        'SELECT t.*, t."WS0" AS "WS" FROM (%(l1)s) t '
+        'UNION ALL '
+        'SELECT t.*, ADD_SECONDS(t."WS0", -%(step)d) AS "WS" FROM (%(l1)s) t'
+        ') e CROSS JOIN ('
+        'SELECT MIN("WS0") AS "TMIN", '
+        'ADD_SECONDS(%(epoch)s, CEIL(SECONDS_BETWEEN(%(epoch)s, MAX("TS")) / %(step)d.0) * %(step)d) AS "TMAX" '
+        'FROM (%(l1)s) m'
+        ') r WHERE e."WS" >= r."TMIN" AND ADD_SECONDS(e."WS", %(size)d) <= r."TMAX"'
+        % {'l1': l1, 'step': WINDOW_STEP_S, 'size': WINDOW_SIZE_S, 'epoch': _EPOCH}
+    )
+
+
+def _lag_sql(ev):
+    """Intervalos (s) entre solicitudes consecutivas dentro de cada ventana."""
+    return (
+        'SELECT x.*, '
+        'NANO100_BETWEEN(LAG(x."TS") OVER (PARTITION BY x."WS" ORDER BY x."TS"), x."TS") / 10000000.0 AS "D_TS", '
+        'NANO100_BETWEEN(LAG(x."ET") OVER (PARTITION BY x."WS" ORDER BY x."ET"), x."ET") / 10000000.0 AS "D_ET" '
+        'FROM (%s) x' % ev
+    )
+
+
+# --------------------------------------------------------------------------
+# 2) Tabla temporal de eventos (system)
+# --------------------------------------------------------------------------
+def prepare_system_events(conn, df_week, table=SYSTEM_EVENTS_TABLE):
+    """Crea la tabla temporal con los eventos expandidos y sus banderas para un batch."""
+    l0 = (
+        'SELECT %s AS "TS", %s AS "ET", "CLIENT_IP", %s AS "HTTP_STATUS_CODE", '
+        '"HEADERS_HTTP_REQUEST_METHOD", "SAP_FUNCTION_LOG_TYPE", "HEATHERS_REQUEST_PATH", '
+        '"SAP_FUNCTION_APPLICATION", "SAP_SOURCE_TYPE", "SAP_APP_ENV", "REGION_CODE", '
+        '"HEADERS_HTTP_HOST", "HEADERS_CONTENT_TYPE" FROM (%s) s'
+        % (_ts('TIMESTAMP'), _ts('EVENT_TIME_REQUESTED'), _num('HTTP_STATUS_CODE'),
+           df_week.select_statement)
+    )
+
+    n_bad = conn.sql('SELECT COUNT(*) AS N FROM (%s) b WHERE "TS" IS NULL' % l0).collect().iloc[0, 0]
+    if n_bad:
+        raise ValueError('Hay %d logs sin un TIMESTAMP válido.' % n_bad)
+
+    lt = 'UPPER("SAP_FUNCTION_LOG_TYPE")'
+    l1 = (
+        'SELECT s.*, %s AS "WS0", '
+        'CASE WHEN "HTTP_STATUS_CODE" IS NOT NULL AND "HTTP_STATUS_CODE" <> 200 THEN 1 ELSE 0 END AS "IS_NON200", '
+        'CASE WHEN "HTTP_STATUS_CODE" BETWEEN 400 AND 499 THEN 1 ELSE 0 END AS "IS_4XX", '
+        'CASE WHEN "HTTP_STATUS_CODE" BETWEEN 500 AND 599 THEN 1 ELSE 0 END AS "IS_5XX", '
+        'CASE WHEN "SAP_FUNCTION_LOG_TYPE" IS NOT NULL THEN 1 ELSE 0 END AS "HAS_LT", '
+        'CASE WHEN %s = \'ERROR\' THEN 1 ELSE 0 END AS "IS_ERROR", '
+        'CASE WHEN %s = \'WARNING\' THEN 1 ELSE 0 END AS "IS_WARNING", '
+        'CASE WHEN %s = \'SECURITY\' THEN 1 ELSE 0 END AS "IS_SECURITY", '
+        'CASE WHEN %s = \'AUDIT\' THEN 1 ELSE 0 END AS "IS_AUDIT", '
+        'CASE WHEN %s = \'INFO\' THEN 1 ELSE 0 END AS "IS_INFO", '
+        'CASE WHEN UPPER("HEADERS_HTTP_REQUEST_METHOD") = \'GET\' THEN 1 ELSE 0 END AS "IS_GET" '
+        'FROM (%s) s' % (_floor_step('s."TS"'), lt, lt, lt, lt, lt, l0)
+    )
+
+    drop_temp(conn, table)
+    _run(conn, 'CREATE LOCAL TEMPORARY COLUMN TABLE %s AS (%s)' % (_q(table), _lag_sql(_expand_sql(l1))))
+    return table
+
+
+# --------------------------------------------------------------------------
+# 3) Bloques de features (system)
+# --------------------------------------------------------------------------
+def _main_agg_sql(t):
+    d = lambda a, b: 'TO_DOUBLE(SUM("%s")) / NULLIF(SUM("%s"), 0)' % (a, b)
+    return (
+        'SELECT "WS", COUNT(*) AS "TOTAL_REQUESTS", '
+        'CASE WHEN COUNT("D_TS") > 1 THEN STDDEV("D_TS") END AS "REQUEST_RATE_STD", '
+        'COUNT(DISTINCT "CLIENT_IP") AS "UNIQUE_IPS_COUNT", '
+        '%s AS "ERROR_RATE_400", %s AS "ERROR_RATE_500", '
+        '%s AS "RATIO_ERROR", %s AS "RATIO_WARN", %s AS "RATIO_SECURITY", '
+        '%s AS "RATIO_INFO", %s AS "RATIO_AUDIT", '
+        'TO_DOUBLE(SUM("IS_GET")) / COUNT(*) AS "GET_VS_POST_RATIO", '
+        'TO_DOUBLE(SUM("IS_NON200")) / COUNT(*) AS "NON_200_RATE", '
+        'CASE WHEN COUNT("D_ET") > 1 THEN STDDEV("D_ET") / NULLIF(AVG("D_ET"), 0) END AS "INTERVAL_CV" '
+        'FROM %s GROUP BY "WS"'
+        % (d('IS_4XX', 'IS_NON200'), d('IS_5XX', 'IS_NON200'),
+           d('IS_ERROR', 'HAS_LT'), d('IS_WARNING', 'HAS_LT'), d('IS_SECURITY', 'HAS_LT'),
+           d('IS_INFO', 'HAS_LT'), d('IS_AUDIT', 'HAS_LT'), _q(t))
+    )
+
+
+def _ip_sql(t):
+    """Entropía de Shannon normalizada (0 si <=1 IP) y concentración de la IP más activa."""
+    return (
+        'SELECT "WS", '
+        'CASE WHEN COUNT(*) > 1 THEN (-SUM("P" * LN("P"))) / LN(COUNT(*)) ELSE 0 END AS "IP_ENTROPY", '
+        'MAX("P") AS "IP_TOP_SHARE" FROM ('
+        'SELECT "WS", TO_DOUBLE("C") / SUM("C") OVER (PARTITION BY "WS") AS "P" FROM ('
+        'SELECT "WS", "CLIENT_IP", COUNT(*) AS "C" FROM %s WHERE "CLIENT_IP" IS NOT NULL '
+        'GROUP BY "WS", "CLIENT_IP") g) pp GROUP BY "WS"' % _q(t)
+    )
+
+
+def _js_sql(t, col):
+    """
+    Divergencia de Jensen-Shannon (bits, 0..1) entre la mezcla de categorías de cada
+    ventana (P) y la del batch completo (Q). Las categorías que no aparecen en la ventana
+    aportan 0.5 * Q cada una, de ahí el término 0.5 * (1 - SUM(Q en la ventana)).
+    Para usar otra línea base (p. ej. un periodo fijo) basta cambiar cómo se calcula Q aquí.
+    """
+    cat = "COALESCE(TO_NVARCHAR(%s), '__NA__')" % _q(col)
+    return (
+        'SELECT "WS", SUM(0.5 * "P" * LN(2 * "P" / ("P" + "Q")) / LN(2) '
+        '+ 0.5 * "Q" * LN(2 * "Q" / ("P" + "Q")) / LN(2)) + 0.5 * (1 - SUM("Q")) AS "JS_%s" FROM ('
+        'SELECT "WS", "CAT", TO_DOUBLE("C") / SUM("C") OVER (PARTITION BY "WS") AS "P", '
+        'TO_DOUBLE(SUM("C") OVER (PARTITION BY "CAT")) / SUM("C") OVER () AS "Q" FROM ('
+        'SELECT "WS", %s AS "CAT", COUNT(*) AS "C" FROM %s GROUP BY "WS", %s) g) pq GROUP BY "WS"'
+        % (col, cat, _q(t), cat)
+    )
+
+
+def _novel_sql(t, hist, t0_sql, col, alias):
+    """Valores de `col` vistos por primera vez (en TODO el historial) dentro de la ventana."""
+    return (
+        'SELECT e."WS", COUNT(*) AS "%s" FROM ('
+        'SELECT DISTINCT "WS", %s AS "V" FROM %s WHERE %s IS NOT NULL) e '
+        'JOIN (SELECT %s AS "V", MIN("TS") AS "FS" FROM (%s) h WHERE %s IS NOT NULL GROUP BY %s) f '
+        'ON f."V" = e."V" '
+        'WHERE f."FS" >= e."WS" AND e."WS" >= ADD_SECONDS(%s, %d) GROUP BY e."WS"'
+        % (alias, _q(col), _q(t), _q(col), _q(col), hist, _q(col), _q(col), t0_sql, WARMUP_S)
+    )
+
+
+# --------------------------------------------------------------------------
+# 4) Ventanas system
+# --------------------------------------------------------------------------
+def build_system_windows(conn, df_week, df_history, table=SYSTEM_EVENTS_TABLE,
+                         categorical_cols=CATEGORICAL_COLS_SYSTEM):
+    """
+    Genera las ventanas system de un batch (DataFrame de hana_ml) y devuelve un DataFrame
+    de hana_ml (perezoso) con una fila por ventana, sin orden garantizado
+    (ordenar por WINDOW_START al descargar, o usar materialize()).
+
+    df_week:    logs system del batch (p. ej. una semana).
+    df_history: logs system de TODO el historial (para primera aparición y calentamiento).
+    """
+    prepare_system_events(conn, df_week, table)
+
+    hist = 'SELECT %s AS "TS", "CLIENT_IP", "HEATHERS_REQUEST_PATH" FROM (%s) h0' % (
+        _ts('TIMESTAMP'), df_history.select_statement)
+    t0 = conn.sql('SELECT MIN("TS") AS T0 FROM (%s) z' % hist).collect().iloc[0, 0]
+    t0_sql = "TO_TIMESTAMP('%s', 'YYYY-MM-DD HH24:MI:SS.FF3')" % t0.strftime('%Y-%m-%d %H:%M:%S.%f')[:-3]
+
+    blocks = [('A', _main_agg_sql(table)), ('IP', _ip_sql(table))]
+    for i, col in enumerate(categorical_cols):
+        blocks.append(('J%d' % i, _js_sql(table, col)))
+    blocks.append(('N1', _novel_sql(table, hist, t0_sql, 'CLIENT_IP', 'NOVEL_IPS')))
+    blocks.append(('N2', _novel_sql(table, hist, t0_sql, 'HEATHERS_REQUEST_PATH', 'NOVEL_PATHS')))
+
+    select = ['A."WS" AS "WINDOW_START"', 'A."TOTAL_REQUESTS"', 'A."REQUEST_RATE_STD"',
+              'A."UNIQUE_IPS_COUNT"', 'A."ERROR_RATE_400"', 'A."ERROR_RATE_500"',
+              'A."RATIO_ERROR"', 'A."RATIO_WARN"', 'A."RATIO_SECURITY"', 'A."RATIO_INFO"',
+              'A."RATIO_AUDIT"', 'COALESCE(IP."IP_ENTROPY", 0) AS "IP_ENTROPY"',
+              'A."GET_VS_POST_RATIO"']
+    select += ['J%d."JS_%s"' % (i, c) for i, c in enumerate(categorical_cols)]
+    select += ['IP."IP_TOP_SHARE"',
+               'COALESCE(N1."NOVEL_IPS", 0) AS "NOVEL_IPS"',
+               'COALESCE(N2."NOVEL_PATHS", 0) AS "NOVEL_PATHS"',
+               'A."NON_200_RATE"', 'A."INTERVAL_CV"']
+
+    joins = ' '.join('LEFT JOIN (%s) %s ON %s."WS" = A."WS"' % (sql, name, name)
+                     for name, sql in blocks[1:])
+    final = 'SELECT %s FROM (%s) A %s' % (', '.join(select), blocks[0][1], joins)
+    return conn.sql(final)
+
+
+# --------------------------------------------------------------------------
+# 5) Ventanas LLM
+# --------------------------------------------------------------------------
+def prepare_llm_events(conn, df_week, table=LLM_EVENTS_TABLE):
+    """Tabla temporal con los eventos LLM expandidos. No arrastra el texto del prompt, solo su longitud."""
+    msg = 'UPPER(COALESCE("SAP_FUNCTION_MESSAGE", \'\'))'
+    l0 = (
+        'SELECT %s AS "TS", %s AS "COST", %s AS "COMP_TOK", %s AS "PROMPT_TOK", %s AS "RESP_MS", '
+        '%s AS "TEMP", UPPER("LLM_STATUS") AS "STATUS", "LLM_PROMPT_CATEGORY" AS "CAT", '
+        'LOWER(TO_NVARCHAR("LLM_STREAM")) AS "STREAM", LENGTH("LLM_PROMPT") AS "PROMPT_LEN", '
+        'CASE WHEN %s LIKE \'%%INJECTION%%\' OR %s LIKE \'%%ADVERSARIAL%%\' THEN 1 ELSE 0 END AS "IS_INJ" '
+        'FROM (%s) s'
+        % (_ts('TIMESTAMP'), _num('LLM_COST_USD'), _num('LLM_COMPLETION_TOKENS'),
+           _num('LLM_PROMPT_TOKENS'), _num('LLM_RESPONSE_TIME_MS'), _num('LLM_TEMPERATURE'),
+           msg, msg, df_week.select_statement)
+    )
+
+    n_bad = conn.sql('SELECT COUNT(*) AS N FROM (%s) b WHERE "TS" IS NULL' % l0).collect().iloc[0, 0]
+    if n_bad:
+        raise ValueError('Hay %d logs sin un TIMESTAMP válido.' % n_bad)
+
+    l1 = (
+        'SELECT s.*, %s AS "WS0", '
+        'CASE WHEN "STATUS" = \'ERROR\' THEN 1 ELSE 0 END AS "IS_ERROR", '
+        'CASE WHEN "STATUS" = \'TIMEOUT\' THEN 1 ELSE 0 END AS "IS_TIMEOUT", '
+        'CASE WHEN "STREAM" = \'true\' THEN 1 ELSE 0 END AS "IS_STREAM", '
+        '"COMP_TOK" / NULLIF("PROMPT_TOK", 0) AS "TOKEN_RATIO" '
+        'FROM (%s) s' % (_floor_step('s."TS"'), l0)
+    )
+
+    drop_temp(conn, table)
+    _run(conn, 'CREATE LOCAL TEMPORARY COLUMN TABLE %s AS (%s)' % (_q(table), _expand_sql(l1)))
+    return table
+
+
+def _entropy_sql(t, col, alias):
+    """Entropía de Shannon normalizada de `col` por ventana (0 si hay <=1 categoría)."""
+    return (
+        'SELECT "WS", CASE WHEN COUNT(*) > 1 THEN (-SUM("P" * LN("P"))) / LN(COUNT(*)) ELSE 0 END AS "%s" FROM ('
+        'SELECT "WS", TO_DOUBLE("C") / SUM("C") OVER (PARTITION BY "WS") AS "P" FROM ('
+        'SELECT "WS", %s, COUNT(*) AS "C" FROM %s WHERE %s IS NOT NULL GROUP BY "WS", %s) g) pp GROUP BY "WS"'
+        % (alias, _q(col), _q(t), _q(col), _q(col))
+    )
+
+
+def build_llm_windows(conn, df_week, table=LLM_EVENTS_TABLE):
+    """
+    Genera las ventanas LLM de un batch (DataFrame de hana_ml) y devuelve un DataFrame
+    de hana_ml (perezoso) con una fila por ventana. Mismo flujo y precauciones que
+    build_system_windows (la tabla temporal se reemplaza en cada llamada).
+    """
+    prepare_llm_events(conn, df_week, table)
+    t = _q(table)
+    agg = (
+        'SELECT "WS", COUNT(*) AS "TOTAL_LLM_REQUESTS", AVG("COST") AS "AVG_LLM_COST_USD", '
+        'TO_DOUBLE(SUM("IS_INJ")) / COUNT(*) AS "RATIO_INJECTION", '
+        'AVG("TOKEN_RATIO") AS "AVG_TOKEN_RATIO", AVG("RESP_MS") AS "AVG_RESPONSE_TIME_MS", '
+        'TO_DOUBLE(SUM("IS_ERROR")) / COUNT(*) AS "LLM_ERROR_RATE", '
+        'TO_DOUBLE(SUM("IS_TIMEOUT")) / COUNT(*) AS "LLM_TIMEOUT_RATE", '
+        'CASE WHEN COUNT("TEMP") > 1 THEN POWER(STDDEV("TEMP"), 2) END AS "TEMPERATURE_VARIANCE", '
+        'TO_DOUBLE(SUM("IS_STREAM")) / COUNT(*) AS "STREAM_RATIO", '
+        'AVG("PROMPT_LEN") AS "AVG_PROMPT_LENGTH", MAX("PROMPT_LEN") AS "MAX_PROMPT_LENGTH" '
+        'FROM %s GROUP BY "WS"' % t
+    )
+    final = (
+        'SELECT A."WS" AS "WINDOW_START", A."TOTAL_LLM_REQUESTS", A."AVG_LLM_COST_USD", '
+        'A."RATIO_INJECTION", A."AVG_TOKEN_RATIO", A."AVG_RESPONSE_TIME_MS", A."LLM_ERROR_RATE", '
+        'A."LLM_TIMEOUT_RATE", A."TEMPERATURE_VARIANCE", '
+        'COALESCE(E."PROMPT_CATEGORY_ENTROPY", 0) AS "PROMPT_CATEGORY_ENTROPY", '
+        'A."STREAM_RATIO", A."AVG_PROMPT_LENGTH", A."MAX_PROMPT_LENGTH" '
+        'FROM (%s) A LEFT JOIN (%s) E ON E."WS" = A."WS"'
+        % (agg, _entropy_sql(table, 'CAT', 'PROMPT_CATEGORY_ENTROPY'))
+    )
+    return conn.sql(final)
+
+
+# --------------------------------------------------------------------------
+# 6) Materializar ventanas para el modelo
+# --------------------------------------------------------------------------
+def materialize(conn, win_df, name, index_col='WINDOW_INDEX'):
+    """
+    Guarda las ventanas en una tabla temporal local, con un índice entero 1..N ordenado
+    por WINDOW_START (clave que pide el Isolation Forest). Las features se convierten a DOUBLE. Evita recalcular la consulta
+    en cada paso del modelo y no deja tablas permanentes. Devuelve un DataFrame de hana_ml.
+    """
+    drop_temp(conn, name)
+    # PAL solo acepta INTEGER/DOUBLE: COUNT() sale BIGINT y AVG() de enteros sale DECIMAL.
+    feats = ', '.join('CAST(w.%s AS DOUBLE) AS %s' % (_q(c), _q(c))
+                      for c in win_df.columns if c != 'WINDOW_START')
+    sql = ('SELECT CAST(ROW_NUMBER() OVER (ORDER BY "WINDOW_START") AS INTEGER) AS "%s", '
+           'w."WINDOW_START", %s FROM (%s) w' % (index_col, feats, win_df.select_statement))
+    _run(conn, 'CREATE LOCAL TEMPORARY COLUMN TABLE %s AS (%s)' % (_q(name), sql))
+    return conn.sql('SELECT * FROM %s' % _q(name))
