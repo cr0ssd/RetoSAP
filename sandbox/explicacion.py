@@ -19,6 +19,29 @@ import pandas as pd
 
 _KEY = 'CF_ID'   # clave compuesta: WINDOW_INDEX * 100 + posición de la feature
 
+# Familias de features para el contrafactual por grupos (reemplazo simultáneo de todo el grupo).
+FAMILIAS_SYSTEM = {
+    'Volumen y ritmo': ['TOTAL_REQUESTS', 'REQUEST_RATE_STD', 'INTERVAL_CV'],
+    'Origen (IPs)': ['UNIQUE_IPS_COUNT', 'IP_ENTROPY', 'IP_TOP_SHARE'],
+    'Tipo de log': ['RATIO_ERROR', 'RATIO_WARN', 'RATIO_SECURITY', 'RATIO_INFO', 'RATIO_AUDIT',
+                    'JS_SAP_FUNCTION_LOG_TYPE'],
+    'Respuestas HTTP': ['ERROR_RATE_400', 'ERROR_RATE_500', 'NON_200_RATE', 'JS_HTTP_STATUS_CODE'],
+    'Peticiones': ['GET_VS_POST_RATIO', 'JS_HEADERS_HTTP_REQUEST_METHOD',
+                   'JS_HEATHERS_REQUEST_PATH', 'JS_HEADERS_CONTENT_TYPE'],
+    'Contexto SAP': ['JS_SAP_FUNCTION_APPLICATION', 'JS_SAP_SOURCE_TYPE', 'JS_SAP_APP_ENV',
+                     'JS_REGION_CODE'],
+}
+FAMILIAS_LLM = {
+    'Volumen y recursos': ['TOTAL_LLM_REQUESTS', 'AVG_LLM_COST_USD', 'AVG_TOKEN_RATIO',
+                           'AVG_RESPONSE_TIME_MS'],
+    'Fallos': ['LLM_ERROR_RATE', 'LLM_TIMEOUT_RATE'],
+    'Contenido del prompt': ['AVG_PROMPT_LENGTH', 'MAX_PROMPT_LENGTH', 'PROMPT_CATEGORY_ENTROPY'],
+    'Parámetros de la llamada': ['TEMPERATURE_VARIANCE', 'STREAM_RATIO'],
+    'Mensajes de seguridad': ['INJECTION_COUNT', 'SAFETY_POLICY_COUNT', 'AUTH_FAILURE_COUNT',
+                              'ACCESS_DENIED_COUNT', 'RATE_ABUSE_COUNT', 'DUPLICATE_REQUEST_COUNT',
+                              'MALFORMED_INPUT_COUNT'],
+}
+
 
 def contrafactual(conn, model, win, features, score_orig, anomalous_idx,
                   contamination=0.01, key='WINDOW_INDEX'):
@@ -117,3 +140,79 @@ def explicar_eventos(if_df, cf, z):
         'Z_VALOR_MEDIO': zg.groupby('EVENTO_ID')['Z'].first(),
     })
     return cf_ev.join(z_ev, how='outer').reset_index()
+
+
+def contrafactual_familias(conn, model, win, features, familias, score_orig, anomalous_idx,
+                           contamination=0.01, key='WINDOW_INDEX'):
+    """
+    Igual que `contrafactual`, pero reemplaza por la mediana TODAS las features de una familia
+    a la vez. Evita que las features correlacionadas se compensen entre sí.
+    familias: dict {nombre: [features]}. Devuelve un DataFrame largo con
+    WINDOW_INDEX, FAMILIA, N_FEATURES, SCORE_ORIG, SCORE_NUEVO, DELTA.
+    Ojo: una familia con más features tiende a bajar más el score; compara con N_FEATURES a la vista.
+    """
+    cols_out = ['WINDOW_INDEX', 'FAMILIA', 'N_FEATURES', 'SCORE_ORIG', 'SCORE_NUEVO', 'DELTA']
+    if len(anomalous_idx) == 0:
+        return pd.DataFrame(columns=cols_out)
+    nombres = list(familias)
+    if len(nombres) > 99:
+        raise ValueError('contrafactual_familias soporta hasta 99 familias.')
+    desconocidas = sorted({f for fs in familias.values() for f in fs} - set(features))
+    if desconocidas:
+        raise ValueError('Features de familias que no están en `features`: %s' % desconocidas)
+
+    q = lambda c: '"%s"' % c
+    src = win.select_statement
+    med = conn.sql('SELECT %s FROM (%s) m' % (
+        ', '.join('MEDIAN(%s) AS %s' % (q(f), q(f)) for f in features), src)).collect().iloc[0]
+    idx = ', '.join(str(int(i)) for i in anomalous_idx)
+
+    parts, usadas = [], {}
+    for k, nombre in enumerate(nombres):
+        reemplazar = {f for f in familias[nombre] if not pd.isna(med[f])}
+        if not reemplazar:
+            continue
+        usadas[k] = len(reemplazar)
+        cols = ', '.join(('CAST(%.17g AS DOUBLE)' % med[g] if g in reemplazar else q(g)) + ' AS ' + q(g)
+                         for g in features)
+        parts.append('SELECT %s * 100 + %d AS %s, %s FROM (%s) w WHERE %s IN (%s)'
+                     % (q(key), k, q(_KEY), cols, src, q(key), idx))
+    edited = conn.sql(' UNION ALL '.join(parts))
+
+    pred = model.predict(data=edited, key=_KEY, features=features,
+                         contamination=contamination, show_explainer=False).collect()
+    k = pred[_KEY] % 100
+    pred['WINDOW_INDEX'] = pred[_KEY] // 100
+    pred['FAMILIA'] = [nombres[i] for i in k]
+    pred['N_FEATURES'] = [usadas[i] for i in k]
+    pred['SCORE_ORIG'] = pred['WINDOW_INDEX'].map(score_orig)
+    pred = pred.rename(columns={'SCORE': 'SCORE_NUEVO'})
+    pred['DELTA'] = pred['SCORE_ORIG'] - pred['SCORE_NUEVO']
+    return pred[cols_out].reset_index(drop=True)
+
+
+def perfil_familias(if_df, z, familias, top=3):
+    """
+    Perfil descriptivo por evento, para clasificar tipos de anomalía a mano.
+    Una fila por evento: z-score promedio en valor absoluto de cada familia (promedio sobre las
+    features de la familia y sobre las ventanas del evento; no depende del tamaño de la familia)
+    y TOP_FEATURES, las `top` features más desviadas con su z con signo (+ alto, - bajo).
+    Requiere EVENTO_ID en if_df y WEEK en z.
+    """
+    keys = ['WEEK', 'WINDOW_INDEX']
+    m = if_df.loc[if_df['LABEL'] == -1, keys + ['EVENTO_ID']]
+    if z.empty or m.empty:
+        return pd.DataFrame()
+    ze = z.merge(m, on=keys)
+    ze['ABSZ'] = ze['Z'].abs()
+    feature_a_familia = {f: n for n, fs in familias.items() for f in fs}
+    ze['FAMILIA'] = ze['FEATURE'].map(feature_a_familia)
+
+    perfil = (ze.dropna(subset=['FAMILIA']).groupby(['EVENTO_ID', 'FAMILIA'])['ABSZ'].mean()
+              .unstack('FAMILIA').reindex(columns=list(familias)))
+
+    g = (ze.groupby(['EVENTO_ID', 'FEATURE']).agg(ABSZ=('ABSZ', 'mean'), Z=('Z', 'mean'))
+         .reset_index().sort_values(['EVENTO_ID', 'ABSZ'], ascending=[True, False]))
+    g['_t'] = g['FEATURE'] + ' (' + g['Z'].map('{:+.1f}'.format) + ')'
+    top_txt = g.groupby('EVENTO_ID')['_t'].apply(lambda s: ', '.join(s.head(top))).rename('TOP_FEATURES')
+    return perfil.join(top_txt).round(2).reset_index()
