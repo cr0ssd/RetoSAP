@@ -38,6 +38,27 @@ _TS_FMT = "'YYYY-MM-DD HH24:MI:SS.FF3'"
 SYSTEM_EVENTS_TABLE = '#EV_SYSTEM'
 LLM_EVENTS_TABLE = '#EV_LLM'
 
+# Conteos por ventana de mensajes LLM por tema (patrones LIKE sobre el mensaje en mayúsculas).
+# Cada clave se convierte en una feature (suma de logs de la ventana que coinciden). Los temas se
+# agruparon por significado a partir de los textos de LLM_ERROR; se pueden editar sin tocar el SQL.
+LLM_MESSAGE_THEMES = {
+    'INJECTION_COUNT': ['%INJECTION%', '%ADVERSARIAL%'],
+    'SAFETY_POLICY_COUNT': ['%SAFETY%', '%CONTENT POLICY%', '%CONTENT MODERATION%', '%CONTENT FILTER%',
+                            '%ACCEPTABLE USE%', '%TERMS OF SERVICE%'],
+    'AUTH_FAILURE_COUNT': ['%API KEY%', '%TOKEN EXPIRED%', '%TOKEN HAS EXPIRED%', '%CREDENTIALS%',
+                           '%SIGNATURE%', '%HMAC%'],
+    'ACCESS_DENIED_COUNT': ['%WHITELIST%', '%ALLOWED LIST%', '%IP ADDRESS BLOCKED%', '%GEOGRAPHIC%',
+                            '%REGIONAL COMPLIANCE%', '%PERMISSION%', '%DOES NOT ALLOW ACCESS%'],
+    'RATE_ABUSE_COUNT': ['%RATE LIMIT%', '%TOO MANY SIMULTANEOUS%', '%CONCURRENT REQUEST%',
+                         '%PARALLEL REQUEST%', '%API CALL LIMIT%', '%REQUEST QUOTA%',
+                         '%INSUFFICIENT QUOTA%', '%ACCOUNT QUOTA%', '%BILLING LIMIT%',
+                         '%TOKEN ALLOWANCE%', '%SESSION TOKEN LIMIT%', '%TOKEN BUDGET%'],
+    'DUPLICATE_REQUEST_COUNT': ['%DUPLICATE REQUEST%', '%IDENTICAL REQUEST%', '%ALREADY PROCESSED%'],
+    'MALFORMED_INPUT_COUNT': ['%MALFORMED%', '%REQUEST JSON%', '%NOT VALID JSON%', '%PAYLOAD SIZE%',
+                              '%REQUEST BODY EXCEEDS%', '%PAYLOAD TOO LARGE%',
+                              '%UNSUPPORTED MEDIA TYPE%', '%CONTENT-TYPE HEADER%'],
+}
+
 
 # --------------------------------------------------------------------------
 # Utilidades SQL
@@ -262,18 +283,26 @@ def build_system_windows(conn, df_week, df_history, table=SYSTEM_EVENTS_TABLE,
 # --------------------------------------------------------------------------
 # 5) Ventanas LLM
 # --------------------------------------------------------------------------
+def _theme_flags(msg_expr):
+    """Una bandera 0/1 por tema de LLM_MESSAGE_THEMES: el mensaje coincide con algún patrón."""
+    cols = []
+    for name, pats in LLM_MESSAGE_THEMES.items():
+        cond = ' OR '.join("%s LIKE '%s'" % (msg_expr, p) for p in pats)
+        cols.append('CASE WHEN %s THEN 1 ELSE 0 END AS "F_%s"' % (cond, name))
+    return ', '.join(cols)
+
+
 def prepare_llm_events(conn, df_week, table=LLM_EVENTS_TABLE):
     """Tabla temporal con los eventos LLM expandidos. No arrastra el texto del prompt, solo su longitud."""
     msg = 'UPPER(COALESCE("SAP_FUNCTION_MESSAGE", \'\'))'
     l0 = (
         'SELECT %s AS "TS", %s AS "COST", %s AS "COMP_TOK", %s AS "PROMPT_TOK", %s AS "RESP_MS", '
         '%s AS "TEMP", UPPER("LLM_STATUS") AS "STATUS", "LLM_PROMPT_CATEGORY" AS "CAT", '
-        'LOWER(TO_NVARCHAR("LLM_STREAM")) AS "STREAM", LENGTH("LLM_PROMPT") AS "PROMPT_LEN", '
-        'CASE WHEN %s LIKE \'%%INJECTION%%\' OR %s LIKE \'%%ADVERSARIAL%%\' THEN 1 ELSE 0 END AS "IS_INJ" '
+        'LOWER(TO_NVARCHAR("LLM_STREAM")) AS "STREAM", LENGTH("LLM_PROMPT") AS "PROMPT_LEN", %s '
         'FROM (%s) s'
         % (_ts('TIMESTAMP'), _num('LLM_COST_USD'), _num('LLM_COMPLETION_TOKENS'),
            _num('LLM_PROMPT_TOKENS'), _num('LLM_RESPONSE_TIME_MS'), _num('LLM_TEMPERATURE'),
-           msg, msg, df_week.select_statement)
+           _theme_flags(msg), df_week.select_statement)
     )
 
     n_bad = conn.sql('SELECT COUNT(*) AS N FROM (%s) b WHERE "TS" IS NULL' % l0).collect().iloc[0, 0]
@@ -307,30 +336,33 @@ def _entropy_sql(t, col, alias):
 def build_llm_windows(conn, df_week, table=LLM_EVENTS_TABLE):
     """
     Genera las ventanas LLM de un batch (DataFrame de hana_ml) y devuelve un DataFrame
-    de hana_ml (perezoso) con una fila por ventana. Mismo flujo y precauciones que
-    build_system_windows (la tabla temporal se reemplaza en cada llamada).
+    de hana_ml (perezoso) con una fila por ventana, sin orden garantizado.
+    Mismo flujo y precauciones que build_system_windows (la tabla temporal se reemplaza en cada llamada).
     """
     prepare_llm_events(conn, df_week, table)
     t = _q(table)
+    temas_agg = ', '.join('SUM("F_%s") AS "%s"' % (n, n) for n in LLM_MESSAGE_THEMES)
+    temas_sel = ', '.join('A."%s"' % n for n in LLM_MESSAGE_THEMES)
     agg = (
         'SELECT "WS", COUNT(*) AS "TOTAL_LLM_REQUESTS", AVG("COST") AS "AVG_LLM_COST_USD", '
-        'TO_DOUBLE(SUM("IS_INJ")) / COUNT(*) AS "RATIO_INJECTION", '
+        + temas_agg + ', '
         'AVG("TOKEN_RATIO") AS "AVG_TOKEN_RATIO", AVG("RESP_MS") AS "AVG_RESPONSE_TIME_MS", '
         'TO_DOUBLE(SUM("IS_ERROR")) / COUNT(*) AS "LLM_ERROR_RATE", '
         'TO_DOUBLE(SUM("IS_TIMEOUT")) / COUNT(*) AS "LLM_TIMEOUT_RATE", '
         'CASE WHEN COUNT("TEMP") > 1 THEN POWER(STDDEV("TEMP"), 2) END AS "TEMPERATURE_VARIANCE", '
         'TO_DOUBLE(SUM("IS_STREAM")) / COUNT(*) AS "STREAM_RATIO", '
         'AVG("PROMPT_LEN") AS "AVG_PROMPT_LENGTH", MAX("PROMPT_LEN") AS "MAX_PROMPT_LENGTH" '
-        'FROM %s GROUP BY "WS"' % t
+        'FROM ' + t + ' GROUP BY "WS"'
     )
     final = (
         'SELECT A."WS" AS "WINDOW_START", A."TOTAL_LLM_REQUESTS", A."AVG_LLM_COST_USD", '
-        'A."RATIO_INJECTION", A."AVG_TOKEN_RATIO", A."AVG_RESPONSE_TIME_MS", A."LLM_ERROR_RATE", '
+        + temas_sel + ', '
+        'A."AVG_TOKEN_RATIO", A."AVG_RESPONSE_TIME_MS", A."LLM_ERROR_RATE", '
         'A."LLM_TIMEOUT_RATE", A."TEMPERATURE_VARIANCE", '
         'COALESCE(E."PROMPT_CATEGORY_ENTROPY", 0) AS "PROMPT_CATEGORY_ENTROPY", '
         'A."STREAM_RATIO", A."AVG_PROMPT_LENGTH", A."MAX_PROMPT_LENGTH" '
-        'FROM (%s) A LEFT JOIN (%s) E ON E."WS" = A."WS"'
-        % (agg, _entropy_sql(table, 'CAT', 'PROMPT_CATEGORY_ENTROPY'))
+        'FROM (' + agg + ') A LEFT JOIN (' + _entropy_sql(table, 'CAT', 'PROMPT_CATEGORY_ENTROPY')
+        + ') E ON E."WS" = A."WS"'
     )
     return conn.sql(final)
 
