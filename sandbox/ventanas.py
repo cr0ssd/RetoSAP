@@ -1,29 +1,40 @@
 """
 ventanas.py - Generación de ventanas sobre SAP HANA (solo generación, sin diagnóstico).
 
-Ventanas de 5 min con paso de 2.5 min: cada log cae en 2 ventanas consecutivas y se
-descartan las ventanas parciales de los bordes del batch. Todo se calcula en HANA con SQL;
-solo se descarga al cliente la tabla final de ventanas (unas ~4,000 filas por semana).
+Ventanas de tamaño configurable con traslape fijo del 50 % (paso = tamaño / 2): cada log cae en
+2 ventanas consecutivas y se descartan las ventanas parciales de los bordes del batch. Todo se
+calcula en HANA con SQL; solo se descarga al cliente la tabla final de ventanas.
 
 Flujo (un batch = una semana, ya filtrada en un DataFrame de hana_ml):
 
     import ventanas
-    ventanas.drop_temp(conn)                                    # limpia temporales previos
-    win = ventanas.build_system_windows(conn, system_weeks[0], df_system)
-    df_win = win.collect()                                      # o win.save('WIN_SYSTEM_W0')
+    hist = ventanas.prepare_system_history(conn, df_system)          # una vez por corrida
+    for w in range(n_weeks):
+        ventanas.prepare_system_base(conn, system_weeks[w])          # una vez por semana
+        ventanas.prepare_llm_base(conn, llm_weeks[w])
+        for size_s in ventanas.WINDOW_SIZES_S:                       # una vez por tamaño
+            win = ventanas.build_system_windows(conn, size_s, hist)
+            win = ventanas.materialize(conn, win, '#WIN_SYSTEM')     # o win.collect()
+            ...
+
+Qué se comparte y qué no:
+  * Por corrida: primera aparición de IPs y rutas en TODO el historial (novel_*).
+  * Por semana: parseo de timestamps, banderas y conteos de mensajes LLM (tablas #BASE_*).
+  * Por tamaño: expansión a ventanas, intervalos y agregación (tablas #EV_*).
+Las features no son aditivas entre tamaños (únicos, entropías, CV, divergencias), por eso las
+ventanas grandes se recalculan desde los eventos y no se derivan de las de 5 min.
 
 Decisiones de diseño:
-  * js_* comparan cada ventana contra la distribución de SU PROPIO batch (semana).
-  * novel_ips / novel_paths usan el historial completo (df_history): la primera aparición
-    y el calentamiento de 24 h se miden desde el inicio de todos los datos, no del batch.
-  * Los eventos expandidos se materializan en una tabla temporal local (#EV_SYSTEM / #EV_LLM);
-    el DataFrame devuelto la referencia, así que debe consumirse (collect/save) antes de
-    procesar la siguiente semana, que la reemplaza.
+  * js_* comparan cada ventana contra la distribución de SU PROPIO batch (semana) y tamaño.
+  * novel_ips / novel_paths usan el historial completo: la primera aparición y el calentamiento
+    de 24 h se miden desde el inicio de todos los datos, no del batch.
+  * Las tablas temporales son locales a la sesión. El DataFrame que devuelve build_* las
+    referencia, así que debe consumirse (collect/materialize) antes de pedir el siguiente
+    tamaño o semana, que las reemplaza.
 Los nombres de columna de salida van en MAYÚSCULAS (convención de HANA).
 """
 
-WINDOW_SIZE_S = 300          # 5 min
-WINDOW_STEP_S = 150          # 2.5 min
+WINDOW_SIZES_S = (300, 900, 1800, 3600, 10800)   # 5 min, 15 min, 30 min, 1 h, 3 h
 WARMUP_S = 24 * 3600         # calentamiento para novel_*
 
 # Columnas categóricas con las que se calcula js_* (system).
@@ -35,8 +46,11 @@ CATEGORICAL_COLS_SYSTEM = [
 
 _EPOCH = "TO_TIMESTAMP('1970-01-01 00:00:00', 'YYYY-MM-DD HH24:MI:SS')"
 _TS_FMT = "'YYYY-MM-DD HH24:MI:SS.FF3'"
+SYSTEM_BASE_TABLE = '#BASE_SYSTEM'
+LLM_BASE_TABLE = '#BASE_LLM'
 SYSTEM_EVENTS_TABLE = '#EV_SYSTEM'
 LLM_EVENTS_TABLE = '#EV_LLM'
+FIRST_SEEN_TABLES = {'CLIENT_IP': '#FS_IP', 'HEATHERS_REQUEST_PATH': '#FS_PATH'}
 
 # Conteos por ventana de mensajes LLM por tema (patrones LIKE sobre el mensaje en mayúsculas).
 # Cada clave se convierte en una feature (suma de logs de la ventana que coinciden). Los temas se
@@ -61,8 +75,20 @@ LLM_MESSAGE_THEMES = {
 
 
 # --------------------------------------------------------------------------
-# Utilidades SQL
+# Utilidades
 # --------------------------------------------------------------------------
+def step_of(size_s):
+    """Paso de la ventana: el traslape es siempre exactamente la mitad."""
+    if size_s <= 0 or size_s % 2:
+        raise ValueError('El tamaño de ventana debe ser un número par de segundos, no %r.' % size_s)
+    return size_s // 2
+
+
+def size_label(size_s):
+    """300 -> '5min', 3600 -> '1h' (para nombres de tablas y gráficas)."""
+    return '%dh' % (size_s // 3600) if size_s % 3600 == 0 else '%dmin' % (size_s // 60)
+
+
 def _q(name):
     return '"%s"' % name
 
@@ -80,9 +106,9 @@ def _num(col):
     return ("CASE WHEN %s LIKE_REGEXPR '^[-+]?[0-9]*[.]?[0-9]+([eE][-+]?[0-9]+)?$' THEN TO_DOUBLE(%s) END" % (s, s))
 
 
-def _floor_step(col):
+def _floor_step(col, step_s):
     return ("ADD_SECONDS(%s, FLOOR(SECONDS_BETWEEN(%s, %s) / %d.0) * %d)"
-            % (_EPOCH, _EPOCH, col, WINDOW_STEP_S, WINDOW_STEP_S))
+            % (_EPOCH, _EPOCH, col, step_s, step_s))
 
 
 def _run(conn, sql):
@@ -94,22 +120,35 @@ def _run(conn, sql):
 
 
 def drop_temp(conn, table=SYSTEM_EVENTS_TABLE):
-    """Borra la tabla temporal de eventos si existe."""
+    """Borra la tabla temporal si existe."""
     try:
         _run(conn, 'DROP TABLE %s' % _q(table))
     except Exception:
         pass
 
 
+def _create_temp(conn, table, select_sql):
+    drop_temp(conn, table)
+    _run(conn, 'CREATE LOCAL TEMPORARY COLUMN TABLE %s AS (%s)' % (_q(table), select_sql))
+    return table
+
+
+def _check_timestamps(conn, table):
+    n_bad = conn.sql('SELECT COUNT(*) AS N FROM %s WHERE "TS" IS NULL' % _q(table)).collect().iloc[0, 0]
+    if n_bad:
+        raise ValueError('Hay %d logs sin un TIMESTAMP válido.' % n_bad)
+
+
 # --------------------------------------------------------------------------
 # 1) Expansión a ventanas solapadas (equivale a expand_to_windows)
 # --------------------------------------------------------------------------
-def _expand_sql(l1):
+def _expand_sql(l1, size_s):
     """
-    `l1` debe traer TS y WS0 (inicio de la ventana base de 2.5 min).
-    Duplica cada fila (WS = WS0 y WS = WS0 - 2.5 min) y conserva solo las ventanas
-    completas: [WS, WS + 5 min) dentro del rango observado del batch.
+    `l1` debe traer TS y WS0 (inicio de la ventana base de un paso).
+    Duplica cada fila (WS = WS0 y WS = WS0 - paso) y conserva solo las ventanas
+    completas: [WS, WS + tamaño) dentro del rango observado del batch.
     """
+    step = step_of(size_s)
     return (
         'SELECT e.* FROM ('
         'SELECT t.*, t."WS0" AS "WS" FROM (%(l1)s) t '
@@ -120,7 +159,7 @@ def _expand_sql(l1):
         'ADD_SECONDS(%(epoch)s, CEIL(SECONDS_BETWEEN(%(epoch)s, MAX("TS")) / %(step)d.0) * %(step)d) AS "TMAX" '
         'FROM (%(l1)s) m'
         ') r WHERE e."WS" >= r."TMIN" AND ADD_SECONDS(e."WS", %(size)d) <= r."TMAX"'
-        % {'l1': l1, 'step': WINDOW_STEP_S, 'size': WINDOW_SIZE_S, 'epoch': _EPOCH}
+        % {'l1': l1, 'step': step, 'size': size_s, 'epoch': _EPOCH}
     )
 
 
@@ -134,11 +173,32 @@ def _lag_sql(ev):
     )
 
 
+def _base_with_ws0(base, size_s):
+    return 'SELECT b.*, %s AS "WS0" FROM %s b' % (_floor_step('b."TS"', step_of(size_s)), _q(base))
+
+
 # --------------------------------------------------------------------------
-# 2) Tabla temporal de eventos (system)
+# 2) Preparación de eventos (system): historial, base por semana y expansión por tamaño
 # --------------------------------------------------------------------------
-def prepare_system_events(conn, df_week, table=SYSTEM_EVENTS_TABLE):
-    """Crea la tabla temporal con los eventos expandidos y sus banderas para un batch."""
+def prepare_system_history(conn, df_history):
+    """
+    Una vez por corrida. Calcula el inicio de todos los datos y la primera aparición de cada IP
+    y de cada ruta en TODO el historial (tablas temporales #FS_*). Devuelve el contexto que
+    build_system_windows necesita.
+    """
+    hist = 'SELECT %s AS "TS", "CLIENT_IP", "HEATHERS_REQUEST_PATH" FROM (%s) h0' % (
+        _ts('TIMESTAMP'), df_history.select_statement)
+    t0 = conn.sql('SELECT MIN("TS") AS T0 FROM (%s) z' % hist).collect().iloc[0, 0]
+    t0_sql = "TO_TIMESTAMP('%s', 'YYYY-MM-DD HH24:MI:SS.FF3')" % t0.strftime('%Y-%m-%d %H:%M:%S.%f')[:-3]
+    for col, table in FIRST_SEEN_TABLES.items():
+        _create_temp(conn, table,
+                     'SELECT %s AS "V", MIN("TS") AS "FS" FROM (%s) h WHERE %s IS NOT NULL GROUP BY %s'
+                     % (_q(col), hist, _q(col), _q(col)))
+    return {'t0_sql': t0_sql}
+
+
+def prepare_system_base(conn, df_week, table=SYSTEM_BASE_TABLE):
+    """Una vez por semana: eventos system con timestamps parseados y banderas, sin expandir."""
     l0 = (
         'SELECT %s AS "TS", %s AS "ET", "CLIENT_IP", %s AS "HTTP_STATUS_CODE", '
         '"HEADERS_HTTP_REQUEST_METHOD", "SAP_FUNCTION_LOG_TYPE", "HEATHERS_REQUEST_PATH", '
@@ -147,14 +207,9 @@ def prepare_system_events(conn, df_week, table=SYSTEM_EVENTS_TABLE):
         % (_ts('TIMESTAMP'), _ts('EVENT_TIME_REQUESTED'), _num('HTTP_STATUS_CODE'),
            df_week.select_statement)
     )
-
-    n_bad = conn.sql('SELECT COUNT(*) AS N FROM (%s) b WHERE "TS" IS NULL' % l0).collect().iloc[0, 0]
-    if n_bad:
-        raise ValueError('Hay %d logs sin un TIMESTAMP válido.' % n_bad)
-
     lt = 'UPPER("SAP_FUNCTION_LOG_TYPE")'
-    l1 = (
-        'SELECT s.*, %s AS "WS0", '
+    base = (
+        'SELECT s.*, '
         'CASE WHEN "HTTP_STATUS_CODE" IS NOT NULL AND "HTTP_STATUS_CODE" <> 200 THEN 1 ELSE 0 END AS "IS_NON200", '
         'CASE WHEN "HTTP_STATUS_CODE" BETWEEN 400 AND 499 THEN 1 ELSE 0 END AS "IS_4XX", '
         'CASE WHEN "HTTP_STATUS_CODE" BETWEEN 500 AND 599 THEN 1 ELSE 0 END AS "IS_5XX", '
@@ -165,12 +220,16 @@ def prepare_system_events(conn, df_week, table=SYSTEM_EVENTS_TABLE):
         'CASE WHEN %s = \'AUDIT\' THEN 1 ELSE 0 END AS "IS_AUDIT", '
         'CASE WHEN %s = \'INFO\' THEN 1 ELSE 0 END AS "IS_INFO", '
         'CASE WHEN UPPER("HEADERS_HTTP_REQUEST_METHOD") = \'GET\' THEN 1 ELSE 0 END AS "IS_GET" '
-        'FROM (%s) s' % (_floor_step('s."TS"'), lt, lt, lt, lt, lt, l0)
+        'FROM (%s) s' % (lt, lt, lt, lt, lt, l0)
     )
-
-    drop_temp(conn, table)
-    _run(conn, 'CREATE LOCAL TEMPORARY COLUMN TABLE %s AS (%s)' % (_q(table), _lag_sql(_expand_sql(l1))))
+    _create_temp(conn, table, base)
+    _check_timestamps(conn, table)
     return table
+
+
+def expand_system_events(conn, size_s, base=SYSTEM_BASE_TABLE, table=SYSTEM_EVENTS_TABLE):
+    """Por tamaño: expande los eventos base a ventanas solapadas y calcula los intervalos."""
+    return _create_temp(conn, table, _lag_sql(_expand_sql(_base_with_ws0(base, size_s), size_s)))
 
 
 # --------------------------------------------------------------------------
@@ -225,43 +284,38 @@ def _js_sql(t, col):
     )
 
 
-def _novel_sql(t, hist, t0_sql, col, alias):
+def _novel_sql(t, first_seen, t0_sql, col, alias):
     """Valores de `col` vistos por primera vez (en TODO el historial) dentro de la ventana."""
     return (
         'SELECT e."WS", COUNT(*) AS "%s" FROM ('
         'SELECT DISTINCT "WS", %s AS "V" FROM %s WHERE %s IS NOT NULL) e '
-        'JOIN (SELECT %s AS "V", MIN("TS") AS "FS" FROM (%s) h WHERE %s IS NOT NULL GROUP BY %s) f '
-        'ON f."V" = e."V" '
+        'JOIN %s f ON f."V" = e."V" '
         'WHERE f."FS" >= e."WS" AND e."WS" >= ADD_SECONDS(%s, %d) GROUP BY e."WS"'
-        % (alias, _q(col), _q(t), _q(col), _q(col), hist, _q(col), _q(col), t0_sql, WARMUP_S)
+        % (alias, _q(col), _q(t), _q(col), _q(first_seen), t0_sql, WARMUP_S)
     )
 
 
 # --------------------------------------------------------------------------
 # 4) Ventanas system
 # --------------------------------------------------------------------------
-def build_system_windows(conn, df_week, df_history, table=SYSTEM_EVENTS_TABLE,
+def build_system_windows(conn, size_s, history, base=SYSTEM_BASE_TABLE, table=SYSTEM_EVENTS_TABLE,
                          categorical_cols=CATEGORICAL_COLS_SYSTEM):
     """
-    Genera las ventanas system de un batch (DataFrame de hana_ml) y devuelve un DataFrame
-    de hana_ml (perezoso) con una fila por ventana, sin orden garantizado
-    (ordenar por WINDOW_START al descargar, o usar materialize()).
+    Genera las ventanas system de `size_s` segundos (paso = size_s / 2) para la semana ya
+    preparada con prepare_system_base y devuelve un DataFrame de hana_ml (perezoso) con una fila
+    por ventana, sin orden garantizado (ordenar por WINDOW_START al descargar, o usar materialize()).
 
-    df_week:    logs system del batch (p. ej. una semana).
-    df_history: logs system de TODO el historial (para primera aparición y calentamiento).
+    history: lo que devuelve prepare_system_history (una vez por corrida).
     """
-    prepare_system_events(conn, df_week, table)
-
-    hist = 'SELECT %s AS "TS", "CLIENT_IP", "HEATHERS_REQUEST_PATH" FROM (%s) h0' % (
-        _ts('TIMESTAMP'), df_history.select_statement)
-    t0 = conn.sql('SELECT MIN("TS") AS T0 FROM (%s) z' % hist).collect().iloc[0, 0]
-    t0_sql = "TO_TIMESTAMP('%s', 'YYYY-MM-DD HH24:MI:SS.FF3')" % t0.strftime('%Y-%m-%d %H:%M:%S.%f')[:-3]
+    expand_system_events(conn, size_s, base, table)
 
     blocks = [('A', _main_agg_sql(table)), ('IP', _ip_sql(table))]
     for i, col in enumerate(categorical_cols):
         blocks.append(('J%d' % i, _js_sql(table, col)))
-    blocks.append(('N1', _novel_sql(table, hist, t0_sql, 'CLIENT_IP', 'NOVEL_IPS')))
-    blocks.append(('N2', _novel_sql(table, hist, t0_sql, 'HEATHERS_REQUEST_PATH', 'NOVEL_PATHS')))
+    blocks.append(('N1', _novel_sql(table, FIRST_SEEN_TABLES['CLIENT_IP'], history['t0_sql'],
+                                    'CLIENT_IP', 'NOVEL_IPS')))
+    blocks.append(('N2', _novel_sql(table, FIRST_SEEN_TABLES['HEATHERS_REQUEST_PATH'], history['t0_sql'],
+                                    'HEATHERS_REQUEST_PATH', 'NOVEL_PATHS')))
 
     select = ['A."WS" AS "WINDOW_START"', 'A."TOTAL_REQUESTS"', 'A."REQUEST_RATE_STD"',
               'A."UNIQUE_IPS_COUNT"', 'A."ERROR_RATE_400"', 'A."ERROR_RATE_500"',
@@ -292,8 +346,11 @@ def _theme_flags(msg_expr):
     return ', '.join(cols)
 
 
-def prepare_llm_events(conn, df_week, table=LLM_EVENTS_TABLE):
-    """Tabla temporal con los eventos LLM expandidos. No arrastra el texto del prompt, solo su longitud."""
+def prepare_llm_base(conn, df_week, table=LLM_BASE_TABLE):
+    """
+    Una vez por semana: eventos LLM con timestamps parseados, banderas y conteos de mensajes,
+    sin expandir. No arrastra el texto del prompt, solo su longitud.
+    """
     msg = 'UPPER(COALESCE("SAP_FUNCTION_MESSAGE", \'\'))'
     l0 = (
         'SELECT %s AS "TS", %s AS "COST", %s AS "COMP_TOK", %s AS "PROMPT_TOK", %s AS "RESP_MS", '
@@ -304,23 +361,22 @@ def prepare_llm_events(conn, df_week, table=LLM_EVENTS_TABLE):
            _num('LLM_PROMPT_TOKENS'), _num('LLM_RESPONSE_TIME_MS'), _num('LLM_TEMPERATURE'),
            _theme_flags(msg), df_week.select_statement)
     )
-
-    n_bad = conn.sql('SELECT COUNT(*) AS N FROM (%s) b WHERE "TS" IS NULL' % l0).collect().iloc[0, 0]
-    if n_bad:
-        raise ValueError('Hay %d logs sin un TIMESTAMP válido.' % n_bad)
-
-    l1 = (
-        'SELECT s.*, %s AS "WS0", '
+    base = (
+        'SELECT s.*, '
         'CASE WHEN "STATUS" = \'ERROR\' THEN 1 ELSE 0 END AS "IS_ERROR", '
         'CASE WHEN "STATUS" = \'TIMEOUT\' THEN 1 ELSE 0 END AS "IS_TIMEOUT", '
         'CASE WHEN "STREAM" = \'true\' THEN 1 ELSE 0 END AS "IS_STREAM", '
         '"COMP_TOK" / NULLIF("PROMPT_TOK", 0) AS "TOKEN_RATIO" '
-        'FROM (%s) s' % (_floor_step('s."TS"'), l0)
+        'FROM (%s) s' % l0
     )
-
-    drop_temp(conn, table)
-    _run(conn, 'CREATE LOCAL TEMPORARY COLUMN TABLE %s AS (%s)' % (_q(table), _expand_sql(l1)))
+    _create_temp(conn, table, base)
+    _check_timestamps(conn, table)
     return table
+
+
+def expand_llm_events(conn, size_s, base=LLM_BASE_TABLE, table=LLM_EVENTS_TABLE):
+    """Por tamaño: expande los eventos LLM base a ventanas solapadas."""
+    return _create_temp(conn, table, _expand_sql(_base_with_ws0(base, size_s), size_s))
 
 
 def _entropy_sql(t, col, alias):
@@ -333,13 +389,13 @@ def _entropy_sql(t, col, alias):
     )
 
 
-def build_llm_windows(conn, df_week, table=LLM_EVENTS_TABLE):
+def build_llm_windows(conn, size_s, base=LLM_BASE_TABLE, table=LLM_EVENTS_TABLE):
     """
-    Genera las ventanas LLM de un batch (DataFrame de hana_ml) y devuelve un DataFrame
-    de hana_ml (perezoso) con una fila por ventana, sin orden garantizado.
-    Mismo flujo y precauciones que build_system_windows (la tabla temporal se reemplaza en cada llamada).
+    Genera las ventanas LLM de `size_s` segundos (paso = size_s / 2) para la semana ya preparada
+    con prepare_llm_base y devuelve un DataFrame de hana_ml (perezoso) con una fila por ventana,
+    sin orden garantizado. Mismas precauciones que build_system_windows.
     """
-    prepare_llm_events(conn, df_week, table)
+    expand_llm_events(conn, size_s, base, table)
     t = _q(table)
     temas_agg = ', '.join('SUM("F_%s") AS "%s"' % (n, n) for n in LLM_MESSAGE_THEMES)
     temas_sel = ', '.join('A."%s"' % n for n in LLM_MESSAGE_THEMES)
