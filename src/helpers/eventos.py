@@ -2,8 +2,6 @@
 
 from helpers.imports import pd
 
-MAX_GAP = {'system': 3, 'llm': 3}   # en ventanas consecutivas, como en tu baseline
-
 def agrupar_eventos(res, max_gap):
     """Marca EVENTO_ID: anomalías separadas por <= max_gap ventanas forman un evento. No cruza semanas."""
     res = res.sort_values(['WEEK', 'WINDOW_INDEX']).reset_index(drop=True)
@@ -15,9 +13,10 @@ def agrupar_eventos(res, max_gap):
 
 def resumen_eventos(res):
     """Una fila por evento: inicio, fin, nº de ventanas y ventana pico (mayor SCORE de anomalía)."""
+    cols = ['EVENTO_ID', 'INICIO', 'FIN', 'N_VENTANAS', 'WEEK', 'VENTANA_PICO', 'SCORE_PICO']
     a = res[res['LABEL'] == -1]
     if a.empty:
-        return pd.DataFrame()
+        return pd.DataFrame(columns=cols)
     # En PAL el score más alto suele ser más anómalo; se confirma comparando medias.
     alto_es_anomalo = a['SCORE'].mean() >= res.loc[res['LABEL'] != -1, 'SCORE'].mean()
     pick = a.groupby('EVENTO_ID')['SCORE'].idxmax() if alto_es_anomalo else a.groupby('EVENTO_ID')['SCORE'].idxmin()
@@ -26,4 +25,4 @@ def resumen_eventos(res):
             .set_index('EVENTO_ID'))
     g = a.groupby('EVENTO_ID').agg(INICIO=('WINDOW_START', 'min'), FIN=('WINDOW_START', 'max'),
                                    N_VENTANAS=('WINDOW_INDEX', 'size'))
-    return g.join(pico).reset_index()
+    return g.join(pico).reset_index()[cols]
