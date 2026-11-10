@@ -8,17 +8,15 @@ calcula en HANA con SQL; solo se descarga al cliente la tabla final de ventanas.
 Flujo (un batch = una semana, ya filtrada en un DataFrame de hana_ml):
 
     import ventanas
-    hist = ventanas.prepare_system_history(conn, df_system)          # una vez por corrida
     for w in range(n_weeks):
         ventanas.prepare_system_base(conn, system_weeks[w])          # una vez por semana
         ventanas.prepare_llm_base(conn, llm_weeks[w])
         for size_s in ventanas.WINDOW_SIZES_S:                       # una vez por tamaño
-            win = ventanas.build_system_windows(conn, size_s, hist)
+            win = ventanas.build_system_windows(conn, size_s)
             win = ventanas.materialize(conn, win, '#WIN_SYSTEM')     # o win.collect()
             ...
 
 Qué se comparte y qué no:
-  * Por corrida: primera aparición de IPs y rutas en TODO el historial (novel_*).
   * Por semana: parseo de timestamps, banderas y conteos de mensajes LLM (tablas #BASE_*).
   * Por tamaño: expansión a ventanas, intervalos y agregación (tablas #EV_*).
 Las features no son aditivas entre tamaños (únicos, entropías, CV, divergencias), por eso las
@@ -26,8 +24,8 @@ ventanas grandes se recalculan desde los eventos y no se derivan de las de 5 min
 
 Decisiones de diseño:
   * js_* comparan cada ventana contra la distribución de SU PROPIO batch (semana) y tamaño.
-  * novel_ips / novel_paths usan el historial completo: la primera aparición y el calentamiento
-    de 24 h se miden desde el inicio de todos los datos, no del batch.
+  * Ninguna feature depende de datos fuera de su semana, así que cada semana (y cada dataset
+    semanal) se procesa de forma independiente.
   * Las tablas temporales son locales a la sesión. El DataFrame que devuelve build_* las
     referencia, así que debe consumirse (collect/materialize) antes de pedir el siguiente
     tamaño o semana, que las reemplaza.
@@ -35,7 +33,6 @@ Los nombres de columna de salida van en MAYÚSCULAS (convención de HANA).
 """
 
 WINDOW_SIZES_S = (300, 900, 1800, 3600, 10800)   # 5 min, 15 min, 30 min, 1 h, 3 h
-WARMUP_S = 24 * 3600         # calentamiento para novel_*
 
 # Columnas categóricas con las que se calcula js_* (system).
 CATEGORICAL_COLS_SYSTEM = [
@@ -50,7 +47,6 @@ SYSTEM_BASE_TABLE = '#BASE_SYSTEM'
 LLM_BASE_TABLE = '#BASE_LLM'
 SYSTEM_EVENTS_TABLE = '#EV_SYSTEM'
 LLM_EVENTS_TABLE = '#EV_LLM'
-FIRST_SEEN_TABLES = {'CLIENT_IP': '#FS_IP', 'HEATHERS_REQUEST_PATH': '#FS_PATH'}
 
 # Conteos por ventana de mensajes LLM por tema (patrones LIKE sobre el mensaje en mayúsculas).
 # Cada clave se convierte en una feature (suma de logs de la ventana que coinciden). Los temas se
@@ -178,25 +174,8 @@ def _base_with_ws0(base, size_s):
 
 
 # --------------------------------------------------------------------------
-# 2) Preparación de eventos (system): historial, base por semana y expansión por tamaño
+# 2) Preparación de eventos (system): base por semana y expansión por tamaño
 # --------------------------------------------------------------------------
-def prepare_system_history(conn, df_history):
-    """
-    Una vez por corrida. Calcula el inicio de todos los datos y la primera aparición de cada IP
-    y de cada ruta en TODO el historial (tablas temporales #FS_*). Devuelve el contexto que
-    build_system_windows necesita.
-    """
-    hist = 'SELECT %s AS "TS", "CLIENT_IP", "HEATHERS_REQUEST_PATH" FROM (%s) h0' % (
-        _ts('TIMESTAMP'), df_history.select_statement)
-    t0 = conn.sql('SELECT MIN("TS") AS T0 FROM (%s) z' % hist).collect().iloc[0, 0]
-    t0_sql = "TO_TIMESTAMP('%s', 'YYYY-MM-DD HH24:MI:SS.FF3')" % t0.strftime('%Y-%m-%d %H:%M:%S.%f')[:-3]
-    for col, table in FIRST_SEEN_TABLES.items():
-        _create_temp(conn, table,
-                     'SELECT %s AS "V", MIN("TS") AS "FS" FROM (%s) h WHERE %s IS NOT NULL GROUP BY %s'
-                     % (_q(col), hist, _q(col), _q(col)))
-    return {'t0_sql': t0_sql}
-
-
 def prepare_system_base(conn, df_week, table=SYSTEM_BASE_TABLE):
     """Una vez por semana: eventos system con timestamps parseados y banderas, sin expandir."""
     l0 = (
@@ -284,38 +263,21 @@ def _js_sql(t, col):
     )
 
 
-def _novel_sql(t, first_seen, t0_sql, col, alias):
-    """Valores de `col` vistos por primera vez (en TODO el historial) dentro de la ventana."""
-    return (
-        'SELECT e."WS", COUNT(*) AS "%s" FROM ('
-        'SELECT DISTINCT "WS", %s AS "V" FROM %s WHERE %s IS NOT NULL) e '
-        'JOIN %s f ON f."V" = e."V" '
-        'WHERE f."FS" >= e."WS" AND e."WS" >= ADD_SECONDS(%s, %d) GROUP BY e."WS"'
-        % (alias, _q(col), _q(t), _q(col), _q(first_seen), t0_sql, WARMUP_S)
-    )
-
-
 # --------------------------------------------------------------------------
 # 4) Ventanas system
 # --------------------------------------------------------------------------
-def build_system_windows(conn, size_s, history, base=SYSTEM_BASE_TABLE, table=SYSTEM_EVENTS_TABLE,
+def build_system_windows(conn, size_s, base=SYSTEM_BASE_TABLE, table=SYSTEM_EVENTS_TABLE,
                          categorical_cols=CATEGORICAL_COLS_SYSTEM):
     """
     Genera las ventanas system de `size_s` segundos (paso = size_s / 2) para la semana ya
     preparada con prepare_system_base y devuelve un DataFrame de hana_ml (perezoso) con una fila
     por ventana, sin orden garantizado (ordenar por WINDOW_START al descargar, o usar materialize()).
-
-    history: lo que devuelve prepare_system_history (una vez por corrida).
     """
     expand_system_events(conn, size_s, base, table)
 
     blocks = [('A', _main_agg_sql(table)), ('IP', _ip_sql(table))]
     for i, col in enumerate(categorical_cols):
         blocks.append(('J%d' % i, _js_sql(table, col)))
-    blocks.append(('N1', _novel_sql(table, FIRST_SEEN_TABLES['CLIENT_IP'], history['t0_sql'],
-                                    'CLIENT_IP', 'NOVEL_IPS')))
-    blocks.append(('N2', _novel_sql(table, FIRST_SEEN_TABLES['HEATHERS_REQUEST_PATH'], history['t0_sql'],
-                                    'HEATHERS_REQUEST_PATH', 'NOVEL_PATHS')))
 
     select = ['A."WS" AS "WINDOW_START"', 'A."TOTAL_REQUESTS"', 'A."REQUEST_RATE_STD"',
               'A."UNIQUE_IPS_COUNT"', 'A."ERROR_RATE_400"', 'A."ERROR_RATE_500"',
@@ -324,8 +286,6 @@ def build_system_windows(conn, size_s, history, base=SYSTEM_BASE_TABLE, table=SY
               'A."GET_VS_POST_RATIO"']
     select += ['J%d."JS_%s"' % (i, c) for i, c in enumerate(categorical_cols)]
     select += ['IP."IP_TOP_SHARE"',
-               'COALESCE(N1."NOVEL_IPS", 0) AS "NOVEL_IPS"',
-               'COALESCE(N2."NOVEL_PATHS", 0) AS "NOVEL_PATHS"',
                'A."NON_200_RATE"', 'A."INTERVAL_CV"']
 
     joins = ' '.join('LEFT JOIN (%s) %s ON %s."WS" = A."WS"' % (sql, name, name)
