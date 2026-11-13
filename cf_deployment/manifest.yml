@@ -6,7 +6,7 @@ applications:
   instances: 1
   buildpacks:
   - python_buildpack
-  command: python sandbox/cron_job_worker.py
+  command: python src/cron_job_worker.py
   no-route: true
   health-check-type: process
   env:

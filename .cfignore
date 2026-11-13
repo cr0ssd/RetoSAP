@@ -1,0 +1,10 @@
+.git
+.gitignore
+.DS_Store
+*.ipynb
+sandbox/*.ipynb
+sandbox/.DS_Store
+sandbox/outputs_octubre/
+sandbox/postmortems_generados/
+sandbox/slides_presentacion_soc.pdf
+subir_hana.py

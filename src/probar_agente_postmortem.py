@@ -1,15 +1,12 @@
 """
-probar_agente_postmortem.py - Script de prueba en Sandbox para el Servidor MCP y Agente Forense.
+probar_agente_postmortem.py - Script de prueba en produccion para el Servidor MCP y Agente Forense.
 
 Prueba el flujo completo contra SAP HANA Cloud:
-  1. Consulta los eventos relevantes detectados por el pipeline en RESULT_EVENTS_2026_01.
-  2. Selecciona los 3 incidentes clave requeridos por SAP:
-     - Incidente 1: Ataque en System (Fuerza bruta / DoS de red)
-     - Incidente 2: Ataque en LLM (Prompt injection a modelos de IA)
-     - Incidente 3: Ataque en LLM (Degradacion del servicio / saturacion de timeouts)
+  1. Consulta los eventos relevantes detectados por el pipeline en RESULT_EVENTS_<mes>.
+  2. Selecciona incidentes representativos (Ataque System, Prompt Injection LLM, Degradacion LLM).
   3. Ejecuta el Agente Forense Postmortem para cada uno (obteniendo evidencia cruda via MCP).
-  4. Persiste los reportes en la tabla RESULT_POSTMORTEMS_2026_01 en SAP HANA Cloud.
-  5. Guarda copias locales en Markdown en sandbox/postmortems_generados/.
+  4. Persiste los reportes en la tabla RESULT_POSTMORTEMS_<mes> en SAP HANA Cloud.
+  5. Guarda copias locales en Markdown y PDF en outputs/postmortems/.
 """
 
 import sys
@@ -17,16 +14,19 @@ import os
 import json
 import logging
 
-# Asegurar path
-REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
-if REPO_ROOT not in sys.path:
-    sys.path.insert(0, REPO_ROOT)
-SRC_DIR = os.path.join(REPO_ROOT, 'src')
-if SRC_DIR not in sys.path:
-    sys.path.insert(0, SRC_DIR)
+# Asegurar resolucion de modulos tanto desde src/ como desde la raiz
+SRC_DIR = os.path.dirname(os.path.abspath(__file__))
+REPO_ROOT = os.path.abspath(os.path.join(SRC_DIR, '..'))
+for p in (REPO_ROOT, SRC_DIR):
+    if p not in sys.path:
+        sys.path.insert(0, p)
 
-from sandbox.mcp_hana_tools import HanaMcpTools
-from sandbox.agente_forense_postmortem import AgenteForensePostmortem
+try:
+    from mcp_hana_tools import HanaMcpTools
+    from agente_forense_postmortem import AgenteForensePostmortem
+except ImportError:
+    from src.mcp_hana_tools import HanaMcpTools
+    from src.agente_forense_postmortem import AgenteForensePostmortem
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(name)s: %(message)s')
 log = logging.getLogger('probar_agente')
@@ -37,7 +37,7 @@ def main(mes='2026_01'):
     mcp = HanaMcpTools()
     agente = AgenteForensePostmortem(mcp_tools=mcp)
 
-    out_dir = os.path.join(REPO_ROOT, 'sandbox', 'postmortems_generados')
+    out_dir = os.getenv('OUTPUT_PDF_DIR', os.path.join(REPO_ROOT, 'outputs', 'postmortems'))
     os.makedirs(out_dir, exist_ok=True)
 
     try:
@@ -48,7 +48,7 @@ def main(mes='2026_01'):
         log.info("[INFO] Candidatos System encontrados: %d | Candidatos LLM encontrados: %d",
                  len(candidatos_sys), len(candidatos_llm))
 
-        # 2. Seleccionar los 3 incidentes representativos
+        # 2. Seleccionar incidentes representativos
         seleccionados = []
 
         # Caso 1: Fuerza Bruta / Ataque System
@@ -97,9 +97,6 @@ def main(mes='2026_01'):
         for fila in filas:
             print(f"  • ID: {fila[0]} | Tipo: {fila[1]} | Severidad: {fila[2]:.4f} | Intervalo: {fila[3]} -> {fila[4]}")
         print("="*80 + "\n")
-
-        log.info("[OK] Prueba de prototipo completada con exito.")
-        return reportes_generados
 
     finally:
         mcp.close()

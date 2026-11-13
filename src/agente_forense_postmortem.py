@@ -23,16 +23,19 @@ from dotenv import load_dotenv
 # Cargar variables de entorno (.env)
 load_dotenv()
 
-# Asegurar imports de sandbox y helpers
-REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
-if REPO_ROOT not in sys.path:
-    sys.path.insert(0, REPO_ROOT)
-SRC_DIR = os.path.join(REPO_ROOT, 'src')
-if SRC_DIR not in sys.path:
-    sys.path.insert(0, SRC_DIR)
+# Asegurar resolucion de modulos tanto desde src/ como desde la raiz
+SRC_DIR = os.path.dirname(os.path.abspath(__file__))
+REPO_ROOT = os.path.abspath(os.path.join(SRC_DIR, '..'))
+for p in (REPO_ROOT, SRC_DIR):
+    if p not in sys.path:
+        sys.path.insert(0, p)
 
-from sandbox.mcp_hana_tools import HanaMcpTools
-from sandbox.generador_pdf_postmortem import generar_pdf_postmortem
+try:
+    from mcp_hana_tools import HanaMcpTools
+    from generador_pdf_postmortem import generar_pdf_postmortem
+except ImportError:
+    from src.mcp_hana_tools import HanaMcpTools
+    from src.generador_pdf_postmortem import generar_pdf_postmortem
 
 log = logging.getLogger('agente_forense')
 
@@ -264,7 +267,6 @@ class AgenteForensePostmortem:
                 return resp.text.strip()
             raise RuntimeError("Respuesta vacia recibida de Gemini API.")
         except Exception as e:
-            # Reintento con modelo de respaldo (gemini-2.0-flash o gemini-1.5-flash) si el modelo falla
             model_fallback = "gemini-3.5-flash-lite" if model_name != "gemini-3.5-flash-lite" else "gemini-3.6-flash"
             log.warning("[WARN] Fallo con modelo %s (%s). Reintentando con %s...", model_name, e, model_fallback)
             try:
@@ -355,34 +357,29 @@ Durante la ventana de monitoreo se detecto una desviacion severa respecto a la l
 | Hito | Marca Temporal (UTC) | Descripcion Operativa |
 | :--- | :--- | :--- |
 | **T0 - Inicio de Anomalia** | `{incident_data['inicio']}` | Primer disparo de umbral en Isolation Forest. |
-| **T1 - Ventana Pico** | `{incident_data['ventana_pico']}` | Concentracion maxima de score anomalo ({incident_data['score_pico']:.4f}). |
-| **T2 - Cese / Contencion** | `{incident_data['fin']}` | Normalizacion del trafico y restauracion de la linea base. |
-
-- **Duracion Total Estimada:** `{incident_data['n_ventanas']}` ventanas de observabilidad agregadas.
-- **Top 3 de Firmas de Ataque Votadas:** `{incident_data.get('top3', 'N/A')}`
+| **T1 - Pico de Impacto** | `{incident_data['ventana_pico']}` | Maximo Z-score ({incident_data['z_max']:.2f}) en `{incident_data['z_max_feature']}`. |
+| **T2 - Cese / Mitigacion** | `{incident_data['fin']}` | Fin de la ventana anomala consecutiva registrada. |
 
 ---
 
-## 3. Componentes y Sistemas SAP Comprometidos
+## 3. Sistemas, Servicios y Componentes SAP Comprometidos
 
-- **Servicios Afectados Directamente:** {apps}
-- **Actores / Direcciones IP Identificadas:** {ips}
-- **Ambiente de Ejecucion:** SAP BTP Cloud Foundry / SAP HANA Cloud / Inferencia LLM
-- **Radio de Impacto:** Aislamiento a nivel de microservicio con degradacion en tiempos de respuesta de endpoints de negocio.
+- **Servicios SAP Afectados:** {apps}
+- **Direcciones IP / Origenes:** {ips}
+- **Ambiente de Ejecucion:** SAP BTP Cloud Foundry Runtime / SAP Cloud Services
 
 ---
 
-## 4. Diagnostico de Causa Raiz y Evidencia Forense
+## 4. Analisis Forense de Causa Raiz y Evidencia (Root Cause)
 
-### Analisis del Vector de Ataque:
-El comportamiento analizado revela una clara intencionalidad maliciosa que supera las fluctuaciones ordinarias de carga de trabajo. La combinacion de z-scores anomalos en `{incident_data['z_max_feature']}` junto con los registros crudos obtenidos via MCP en SAP HANA confirman un intento sistematico de **{tipo_ataque}**.
+El analisis estadistico correlacionado indica que el incidente se origino mediante una dispersion anomala clasificada como **{tipo_ataque}**. La telemetria agregada evidencia una alteracion significativa en `{incident_data['z_max_feature']}` alcanzando una desviacion de {incident_data['z_max']:.2f} sigmas sobre la media historica.
 
-### Muestra de Evidencia Forense Extraida (via MCP):
+### Evidencia de Logs Muestreados via MCP:
 {evidencia_bloque}
 
 ---
 
-## 5. Plan de Mitigacion y Recomendaciones de Hardening
+## 5. Plan de Mitigacion y Recomendaciones de Hardening (Action Items)
 
 {hardening_items}
 
