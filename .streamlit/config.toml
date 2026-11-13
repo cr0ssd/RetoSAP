@@ -1,0 +1,22 @@
+[client]
+toolbarMode = "minimal"
+
+# Tema basado en SAP Fiori (Horizon): azul de marca #0070F2, texto azul marino #1D2D3E.
+# Siempre claro: no hay sección de tema oscuro, así que no cambia con el modo del sistema.
+# Barra lateral blanca, separada de la barra superior por bordes.
+[theme]
+base = "light"
+font = "system-ui, -apple-system, 'Segoe UI', sans-serif"
+headingFontWeights = [700, 650, 600, 600, 600, 600]
+baseRadius = "0.75rem"
+showSidebarBorder = true
+primaryColor = "#0070F2"
+backgroundColor = "#F5F6F7"
+secondaryBackgroundColor = "#EAECEE"
+textColor = "#1D2D3E"
+borderColor = "#D9DEE3"
+dataframeHeaderBackgroundColor = "#F5F6F7"
+
+[theme.sidebar]
+backgroundColor = "#FFFFFF"
+secondaryBackgroundColor = "#F5F6F7"
