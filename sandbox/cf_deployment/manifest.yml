@@ -1,0 +1,17 @@
+---
+applications:
+- name: sap-soc-cron-worker
+  memory: 768M
+  disk_quota: 1024M
+  instances: 1
+  buildpacks:
+  - python_buildpack
+  command: python sandbox/cron_job_worker.py
+  no-route: true
+  health-check-type: process
+  env:
+    CRON_INTERVAL_MINUTES: "60"
+    TABLA_DEFAULT: "LOGS_BATCH_1"
+    GEMINI_API_KEY: ""
+    GEMINI_MODEL: "gemini-3.5-flash"
+

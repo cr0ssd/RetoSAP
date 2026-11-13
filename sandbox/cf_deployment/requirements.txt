@@ -1,0 +1,10 @@
+hana-ml==2.30.26091800
+hdbcli==2.30.27
+pandas>=2.2.0
+numpy>=1.26.0
+scikit-learn>=1.4.0
+schedule>=1.2.0
+reportlab>=4.0.0
+python-dotenv>=1.0.0
+google-genai>=1.8.0
+
