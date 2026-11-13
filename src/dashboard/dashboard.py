@@ -3,9 +3,12 @@ import sys
 from contextlib import contextmanager
 from pathlib import Path
 
-ROOT = Path(__file__).resolve().parents[1]
-if str(ROOT) not in sys.path:
-    sys.path.insert(0, str(ROOT))
+DASHBOARD_DIR = Path(__file__).resolve().parent
+SRC_DIR = DASHBOARD_DIR.parent
+REPO_ROOT = SRC_DIR.parent
+for p in (REPO_ROOT, SRC_DIR):
+    if str(p) not in sys.path:
+        sys.path.insert(0, str(p))
 
 import numpy as np
 import pandas as pd
