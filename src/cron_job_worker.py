@@ -21,18 +21,22 @@ import schedule
 from datetime import datetime
 from typing import Optional
 
-# Asegurar path para imports
-REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
-if REPO_ROOT not in sys.path:
-    sys.path.insert(0, REPO_ROOT)
-SRC_DIR = os.path.join(REPO_ROOT, 'src')
-if SRC_DIR not in sys.path:
-    sys.path.insert(0, SRC_DIR)
+# Asegurar resolucion de modulos tanto desde src/ como desde la raiz
+SRC_DIR = os.path.dirname(os.path.abspath(__file__))
+REPO_ROOT = os.path.abspath(os.path.join(SRC_DIR, '..'))
+for p in (REPO_ROOT, SRC_DIR):
+    if p not in sys.path:
+        sys.path.insert(0, p)
 
 from helpers.conexion import conexion
 from helpers.imports import pd
-from sandbox.mcp_hana_tools import HanaMcpTools
-from sandbox.agente_forense_postmortem import AgenteForensePostmortem
+
+try:
+    from mcp_hana_tools import HanaMcpTools
+    from agente_forense_postmortem import AgenteForensePostmortem
+except ImportError:
+    from src.mcp_hana_tools import HanaMcpTools
+    from src.agente_forense_postmortem import AgenteForensePostmortem
 
 logging.basicConfig(
     level=logging.INFO,
@@ -94,7 +98,7 @@ def ejecutar_ciclo_completo(tabla_fuente: str = 'LOGS_BATCH_1', top_k_postmortem
         mcp = HanaMcpTools(conn=conn)
         agente = AgenteForensePostmortem(mcp_tools=mcp)
 
-        out_pdf_dir = os.path.join(REPO_ROOT, 'sandbox', 'postmortems_generados')
+        out_pdf_dir = os.getenv('OUTPUT_PDF_DIR', os.path.join(REPO_ROOT, 'outputs', 'postmortems'))
         os.makedirs(out_pdf_dir, exist_ok=True)
 
         # Obtener candidatos criticos
@@ -110,26 +114,32 @@ def ejecutar_ciclo_completo(tabla_fuente: str = 'LOGS_BATCH_1', top_k_postmortem
             seleccionados.append(pi_llm[0])
         elif candidatos_llm:
             seleccionados.append(candidatos_llm[0])
-        deg_llm = [c for c in candidatos_llm if c not in seleccionados and ('degradación' in c['tipo_ataque'].lower() or 'recursos' in c['tipo_ataque'].lower())]
-        if deg_llm:
-            seleccionados.append(deg_llm[0])
 
-        seleccionados = seleccionados[:top_k_postmortems]
         log.info("[CRON][AGENTE] Incidentes seleccionados para investigar: %d", len(seleccionados))
 
+        postmortems_generados = 0
         for inc in seleccionados:
-            log.info("[CRON][AGENTE] Investigando Incidente Evento %d (%s)...", inc['evento_id'], inc['tipo_ataque'])
-            res = agente.investigar_y_redactar(mes=mes_procesado, incident_data=inc, output_dir=out_pdf_dir)
-            log.info("[CRON][OK] Postmortem generado y persistido: %s", res['postmortem_id'])
+            try:
+                log.info("[CRON][AGENTE] Investigando Incidente Evento %s (%s)...", inc['evento_id'], inc['tipo_ataque'])
+                res = agente.investigar_y_redactar(
+                    mes=mes_procesado,
+                    incident_data=inc,
+                    output_dir=out_pdf_dir
+                )
+                if res:
+                    postmortems_generados += 1
+                    log.info("[CRON][OK] Postmortem generado y persistido: %s", res['postmortem_id'])
+            except Exception as e_inc:
+                log.error("[CRON][ERROR] Error al investigar incidente %s: %s", inc.get('evento_id'), e_inc)
 
-        duracion = time.perf_counter() - inicio_ciclo
+        tiempo_total = time.perf_counter() - inicio_ciclo
         log.info("[CRON] ========================================================")
-        log.info("[CRON][SUCCESS] Ciclo completado en %.1f segundos. Postmortems: %d", duracion, len(seleccionados))
+        log.info("[CRON][SUCCESS] Ciclo completado en %.1f segundos. Postmortems: %d", tiempo_total, postmortems_generados)
         log.info("[CRON] ========================================================")
         return True
 
     except Exception as e:
-        log.error("[CRON][ERROR] Fallo critico durante la ejecucion del ciclo: %s", e, exc_info=True)
+        log.error("[CRON][FATAL] Fallo en el ciclo de observabilidad: %s", e, exc_info=True)
         return False
 
     finally:
