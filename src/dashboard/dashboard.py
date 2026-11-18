@@ -128,6 +128,10 @@ st.html(f"""
       background: {SURFACE}; border: 1px solid {CARD_BORDER} !important;
       border-radius: 14px; padding: 1.1rem 1.25rem 0.9rem; box-shadow: {SOMBRA};
   }}
+  /* Tarjetas lado a lado: todas ocupan la altura de la fila, sin huecos abajo */
+  [data-testid="stColumn"] > [data-testid="stVerticalBlock"]
+      > [data-testid="stLayoutWrapper"]:has(> div[class*="st-key-card_"]) {{ flex: 1 1 auto; }}
+  [data-testid="stColumn"] [data-testid="stLayoutWrapper"] > div[class*="st-key-card_"] {{ height: 100%; }}
   .card-title {{ font-size: 1.02rem; font-weight: 650; color: {INK}; margin: 0; }}
   .card-sub {{ font-size: 0.84rem; color: {MUTED}; margin: 0.2rem 0 0.2rem; line-height: 1.45; }}
 
@@ -199,33 +203,47 @@ st.html(f"""
   .tipo .sen li {{ font-size: .83rem; color: {INK2}; padding: .12rem 0; }}
   .tipo .sen li span {{ display: inline-block; width: 1.3rem; color: var(--c); font-weight: 700; }}
 
-  /* Tarjetas y etiquetas de Postmortems SOC */
-  .pm-banner {{ display: flex; flex-wrap: wrap; justify-content: space-between; align-items: flex-start;
-      gap: 1rem; padding: .95rem 1.15rem; background: {PAGE}; border: 1px solid {CARD_BORDER};
-      border-left: 4px solid var(--c, {BRAND}); border-radius: 12px; margin-bottom: .85rem; }}
-  .pm-banner h3 {{ margin: 0; font-size: 1.05rem; font-weight: 700; color: {INK}; }}
-  .pm-banner .pm-sub {{ margin: .25rem 0 0; font-size: .83rem; color: {MUTED}; }}
-  .pm-pills {{ display: flex; flex-wrap: wrap; gap: .4rem; align-items: center; }}
-  .pm-pill {{ font-size: .74rem; font-weight: 700; padding: .2rem .6rem; border-radius: 999px;
-      background: {SURFACE}; border: 1px solid {CARD_BORDER}; color: {INK2}; }}
-  .pm-pill.crit {{ background: #fdeaea; border-color: #f5b7b1; color: {CRITICO}; }}
-  .pm-pill.warn {{ background: #fff1e3; border-color: #fad3ad; color: #a93e00; }}
-  .pm-pill.brand {{ background: #e5f3ff; border-color: #b5dcff; color: #0057d2; }}
-  .pm-callout {{ background: #f0f7ff; border: 1px solid #bae6fd; border-left: 4px solid {BRAND};
-      border-radius: 10px; padding: .85rem 1rem; margin: .5rem 0 .9rem; color: {INK};
-      font-size: .9rem; line-height: 1.5; }}
-  .pm-callout b {{ display: block; font-size: .73rem; letter-spacing: .06em; text-transform: uppercase;
-      color: #0057d2; margin-bottom: .25rem; }}
-  .pm-meta-grid {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
-      gap: .65rem; margin: .65rem 0 .85rem; }}
-  .pm-meta-item {{ background: {PAGE}; border: 1px solid {CARD_BORDER}; border-radius: 10px;
-      padding: .6rem .8rem; }}
-  .pm-meta-item .lbl {{ font-size: .71rem; font-weight: 700; letter-spacing: .05em;
-      text-transform: uppercase; color: {MUTED}; margin-bottom: .15rem; }}
-  .pm-meta-item .val {{ font-size: .86rem; font-weight: 600; color: {INK}; word-break: break-word; }}
-  .pm-chips {{ display: flex; flex-wrap: wrap; gap: .38rem; margin-top: .35rem; }}
-  .pm-chip {{ font-size: .76rem; font-weight: 600; padding: .22rem .62rem; border-radius: 8px;
-      background: {PAGE}; border: 1px solid {CARD_BORDER}; color: {INK2}; }}
+  /* Postmortems SOC */
+  .pm-head {{ display: flex; flex-wrap: wrap; align-items: center; gap: .5rem; }}
+  .pm-head .id {{ font-size: 1.15rem; font-weight: 700; color: {INK}; margin-right: .2rem; }}
+  .pm-sub {{ font-size: .85rem; color: {MUTED}; margin: .35rem 0 0; line-height: 1.45; }}
+  .pm-sub b {{ color: {INK2}; font-weight: 600; }}
+  .pm-pill {{ font-size: .74rem; font-weight: 700; padding: .18rem .62rem; border-radius: 999px;
+      background: {GRID}; color: {INK2}; white-space: nowrap; }}
+  .pm-pill.crit {{ background: #fdeaea; color: {CRITICO}; }}
+  .pm-pill.warn {{ background: #fff1e3; color: #a93e00; }}
+  .pm-pill.brand {{ background: #e5f3ff; color: #0057d2; }}
+  .pm-meta {{ display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: .75rem; }}
+  .pm-meta.dos {{ grid-template-columns: repeat(2, minmax(0, 1fr)); }}
+  @media (max-width: 1000px) {{ .pm-meta {{ grid-template-columns: repeat(2, minmax(0, 1fr)); }} }}
+  .pm-meta > div {{ background: {PAGE}; border: 1px solid {CARD_BORDER}; border-radius: 10px;
+      padding: .7rem .9rem; }}
+  .pm-meta .lbl {{ font-size: .72rem; font-weight: 700; letter-spacing: .05em; text-transform: uppercase;
+      color: {MUTED}; margin: 0 0 .3rem; }}
+  .pm-meta .val {{ font-size: .95rem; font-weight: 650; color: {INK}; word-break: break-word; }}
+  .pm-meta .det {{ font-size: .8rem; color: {MUTED}; margin-top: .1rem; }}
+  .pm-callout {{ background: #f0f7ff; border: 1px solid #cfe6ff; border-left: 4px solid {BRAND};
+      border-radius: 10px; padding: .85rem 1rem; color: {INK}; font-size: .9rem; line-height: 1.55; }}
+  .pm-callout b {{ display: block; font-size: .72rem; letter-spacing: .06em; text-transform: uppercase;
+      color: #0057d2; margin-bottom: .3rem; }}
+  .pm-chips {{ display: flex; flex-wrap: wrap; gap: .4rem; }}
+  .pm-chip {{ font-size: .78rem; font-weight: 600; padding: .22rem .65rem; border-radius: 8px;
+      background: {SURFACE}; border: 1px solid {CARD_BORDER}; color: {INK2};
+      font-variant-numeric: tabular-nums; }}
+  .pm-vacio {{ font-size: .84rem; color: {MUTED}; }}
+  /* Botones de descarga: neutros, y se pintan de azul el que se señala o se presiona */
+  .st-key-pm_descargas button {{ background: {SURFACE}; color: {INK2}; border: 1px solid {CARD_BORDER};
+      font-weight: 600; transition: background .15s, color .15s, border-color .15s; }}
+  .st-key-pm_descargas button:hover, .st-key-pm_descargas button:focus-visible,
+  .st-key-pm_descargas button:active {{ background: {BRAND}; color: #fff; border-color: {BRAND}; }}
+  .st-key-pm_descargas button:hover *, .st-key-pm_descargas button:active * {{ color: #fff; }}
+  /* Reporte en Markdown: títulos a la escala del resto de la página */
+  .st-key-pm_reporte h1 {{ font-size: 1.3rem !important; padding: .6rem 0 .3rem !important; }}
+  .st-key-pm_reporte h2 {{ font-size: 1.1rem !important; padding: 1rem 0 .3rem !important;
+      border-top: 1px solid {CARD_BORDER}; margin-top: .6rem !important; }}
+  .st-key-pm_reporte h3 {{ font-size: .98rem !important; padding: .7rem 0 .2rem !important; }}
+  .st-key-pm_reporte p, .st-key-pm_reporte li {{ font-size: .9rem; line-height: 1.6; color: {INK2}; }}
+  .st-key-pm_reporte hr {{ display: none; }}
 </style>
 """)
 
@@ -243,9 +261,9 @@ def tarjeta(titulo=None, sub=None):
         yield
 
 
-def encabezado(eyebrow, titulo, sub):
-    pills = [("Periodo", MES.replace("_", "-")), ("Datos", FUENTE), ("Origen", STREAMS[STREAM]),
-             ("Bloques de", ETIQUETA[SIZE_S])]
+def encabezado(eyebrow, titulo, sub, pills=None):
+    pills = pills or [("Periodo", MES.replace("_", "-")), ("Origen", STREAMS[STREAM]),
+                      ("Bloques de", ETIQUETA[SIZE_S])]
     st.html(f'<div class="banner"><div class="eyebrow">{eyebrow}</div>'
             f'<p class="titulo">{titulo}</p>'
             + (f'<p class="sub">{sub}</p>' if sub and sub.strip() else "")
@@ -365,10 +383,10 @@ def _etiqueta_severidad(score):
     """Clasifica severidad Isolation Forest para badges y estilos."""
     s = float(score or 0.0)
     if s >= 0.70:
-        return "[CRITICO]", "crit", CRITICO
+        return "Crítica", "crit", CRITICO
     if s >= 0.45:
-        return "[ALTO]", "warn", "#E76500"
-    return "[MODERADO]", "brand", BRAND
+        return "Alta", "warn", "#E76500"
+    return "Moderada", "brand", BRAND
 
 
 @st.cache_data(ttl=120, show_spinner="Cargando reportes postmortem…")
@@ -432,11 +450,6 @@ def _construir_pdf_bytes(fila):
 
 
 def perfil_relevantes(win, rel, familias):
-    """
-    Igual que la celda 17 de sandbox/demo_pipeline_adrian.ipynb: z por semana con
-    explicacion.zscores (ventanas anómalas contra todas las de su semana) y |z| promedio por
-    familia con explicacion.perfil_familias, solo para los eventos relevantes.
-    """
     feats = [f for fs in familias.values() for f in fs]
     z = []
     for w, g in win.groupby("WEEK"):
@@ -470,7 +483,9 @@ with st.sidebar:
     eventos_all = leer("EVENTS", MES)
     resumen_all = leer("SUMMARY", MES)
     valid_all = leer("VALIDATION", MES)
-    FUENTE = st.selectbox("Conjunto de datos", sorted(eventos_all["SOURCE_TABLE"].unique()), key="fuente")
+    # Cada periodo se analiza a partir de una sola tabla de logs; si hubiera varias, se usa la que
+    # tiene más eventos. No se muestra como filtro para no confundir a quien consulta el dashboard.
+    FUENTE = eventos_all["SOURCE_TABLE"].value_counts().index[0]
     STREAM = st.segmented_control("Origen de los registros", list(STREAMS), default="system",
                                   format_func=STREAMS.get, key="stream",
                                   width="stretch") or "system"
@@ -482,7 +497,7 @@ with st.sidebar:
     st.divider()
     pm_all = leer_postmortems(MES)
     pm_stream_n = int((pm_all["STREAM"].astype(str).str.lower() == STREAM).sum()) if not pm_all.empty else 0
-    st.caption(f"Postmortems SOC ({MES.replace('_', '-')}): **{len(pm_all)}** total | **{pm_stream_n}** en {STREAMS[STREAM]}")
+    st.caption(f"Reportes forenses del periodo: **{len(pm_all)}** ({pm_stream_n} de {STREAMS[STREAM]})")
     if st.button("Actualizar datos en vivo", icon=":material/refresh:", width="stretch"):
         st.cache_data.clear()
         st.rerun()
@@ -658,23 +673,18 @@ def pagina_resumen():
                 })
 
     if not pm_all.empty:
-        pm_act = pm_all[(pm_all["SOURCE_TABLE"] == FUENTE)
-                        & (pm_all["STREAM"].astype(str).str.lower() == STREAM)]
-        sev_top = float(pm_all["SEVERIDAD_SCORE"].max())
-        with tarjeta("Reportes Postmortem SOC (MCP + Gemini)",
-                     "Expedientes forenses persistidos en SAP HANA Cloud listos para triage y descarga PDF."):
-            k1, k2 = st.columns([2.6, 1.2], vertical_alignment="center")
+        n_crit = int((pm_all["SEVERIDAD_SCORE"] >= 0.70).sum())
+        with tarjeta("Reportes forenses",
+                     "Reportes que generó el agente forense para los eventos relevantes del periodo."):
+            k1, k2 = st.columns([4, 1], vertical_alignment="center", gap="medium")
             with k1:
-                st.html(
-                    f'<div class="pm-callout"><b>Cobertura Forense — {html.escape(MES.replace("_", "-"))}</b>'
-                    f'Existen <strong>{len(pm_all)}</strong> reporte(s) postmortem en este periodo '
-                    f'(<strong>{len(pm_act)}</strong> para {html.escape(FUENTE)} / '
-                    f'{html.escape(STREAMS[STREAM])}), con severidad máxima IF de '
-                    f'<strong>{sev_top:.4f}</strong>.</div>'
-                )
+                st.html('<div class="pm-chips">'
+                        f'<span class="pm-chip">{len(pm_all)} reporte(s)</span>'
+                        f'<span class="pm-chip">{n_crit} de severidad crítica</span>'
+                        f'<span class="pm-chip">Severidad máxima '
+                        f'{float(pm_all["SEVERIDAD_SCORE"].max()):.2f}</span></div>')
             with k2:
-                st.page_link(pg_postmortems, label="Abrir Postmortems SOC",
-                             icon=":material/security:")
+                st.page_link(pg_postmortems, label="Ver reportes", icon=":material/arrow_forward:")
 
 
 def pagina_eventos():
@@ -828,287 +838,200 @@ def pagina_modelo():
             st.caption(f"En {no_eval} de {len(VALID)} combinaciones de semana e intervalo no "
                        "hubo datos suficientes para esta comparación.")
 
+def _rango(ini, fin):
+    """Fecha y horario del incidente en dos líneas cortas."""
+    if pd.isna(ini) or pd.isna(fin):
+        return _fmt_ts(ini), ""
+    if ini.date() == fin.date():
+        return f"{ini:%d/%m/%Y}", f"de {ini:%H:%M} a {fin:%H:%M}"
+    return f"{ini:%d/%m/%Y %H:%M}", f"a {fin:%d/%m/%Y %H:%M}"
+
+
+def _sin_titulo(md):
+    """Quita el título principal del reporte: ya aparece en el encabezado de la tarjeta."""
+    lineas = md.lstrip().splitlines()
+    if lineas and lineas[0].startswith("# "):
+        lineas = lineas[1:]
+    return "\n".join(lineas).lstrip()
+
+
+def _chips(items, vacio_txt):
+    if not items:
+        return f'<span class="pm-vacio">{vacio_txt}</span>'
+    return '<div class="pm-chips">' + "".join(
+        f'<span class="pm-chip">{html.escape(x)}</span>' for x in items) + '</div>'
+
+
 def pagina_postmortems():
+    periodo = MES.replace("_", "-")
+    encabezado("Postmortems SOC", "Reportes forenses de los incidentes",
+               "Cada reporte explica un evento relevante: qué pasó, cuándo, qué afectó y qué hacer. "
+               "Selecciona uno en la tabla para ver su detalle y descargarlo.",
+               pills=[("Periodo", periodo), ("Reportes", len(pm_all))])
     if pm_all.empty:
-        encabezado(
-            "Postmortems SOC",
-            f"Expedientes forenses automatizados (MCP + Gemini) para {MES.replace('_', '-')}",
-            "Triage, diagnóstico y exportación ejecutiva",
-        )
-        vacio(
-            f"Aún no existen reportes en RESULT_POSTMORTEMS_{MES}. "
-            "Cuando el worker forense (cron_job_worker.py) procese los eventos relevantes de este periodo, "
-            "los expedientes y PDFs ejecutivos aparecerán aquí automáticamente."
-        )
+        vacio(f"Aún no hay reportes para {periodo}. Aparecerán aquí cuando el agente forense "
+              "(cron_job_worker.py) procese los eventos relevantes del periodo.")
         return
 
-    # Reservamos el slot superior para seguir el patrón SAP Fiori Dynamic Page Header + Actions
-    header_slot = st.container()
-
-    # Barra de filtros (FilterBar) inmediatamente debajo del encabezado
-    f2, f3, f4 = st.columns([1.2, 1.8, 1.3], gap="medium")
-    with f2:
-        streams_disp = sorted(pm_all["STREAM"].dropna().astype(str).str.lower().unique())
-        sel_streams = st.multiselect(
-            "Origen (Stream)", streams_disp, default=streams_disp,
-            format_func=lambda s: STREAMS.get(s, s.upper()), key="pm_streams"
-        )
-    with f3:
-        tipos_disp = sorted(pm_all["TIPO_ATAQUE"].dropna().astype(str).unique())
-        sel_tipos = st.multiselect(
-            "Vector / Tipo de ataque", tipos_disp, default=tipos_disp, key="pm_tipos"
-        )
-    with f4:
-        q_busqueda = st.text_input(
-            "Buscar (ID, MITRE, app o IP)", placeholder="ej. DDoS, T1110, 10.0...",
-            key="pm_buscar"
-        ).strip().lower()
-    solo_activo = st.toggle(
-        f"Filtrar solo al dataset y origen laterales ({FUENTE} / {STREAMS[STREAM]})",
-        value=False, key="pm_solo_activo",
-        help="Si se desactiva, muestra todos los postmortems del periodo aunque difieran del filtro lateral."
-    )
+    # Filtros
+    with tarjeta():
+        f1, f2, f3 = st.columns([1, 1.4, 1.4], gap="medium")
+        origenes = ["todos"] + sorted(pm_all["STREAM"].dropna().astype(str).str.lower().unique())
+        sel_origen = f1.selectbox("Origen", origenes, key="pm_origen",
+                                  format_func=lambda s: "Todos" if s == "todos" else STREAMS.get(s, s))
+        sel_tipos = f2.multiselect("Tipo de ataque",
+                                   sorted(pm_all["TIPO_ATAQUE"].dropna().astype(str).unique()),
+                                   placeholder="Todos los tipos", key="pm_tipos")
+        q = f3.text_input("Buscar", placeholder="Reporte, táctica MITRE, aplicación o IP",
+                          key="pm_buscar").strip().lower()
 
     pm_f = pm_all.copy()
-    pm_f["_STREAM_LC"] = pm_f["STREAM"].astype(str).str.lower()
-    if solo_activo:
-        pm_f = pm_f[(pm_f["SOURCE_TABLE"] == FUENTE) & (pm_f["_STREAM_LC"] == STREAM)]
-    if sel_streams:
-        pm_f = pm_f[pm_f["_STREAM_LC"].isin(sel_streams)]
+    if sel_origen != "todos":
+        pm_f = pm_f[pm_f["STREAM"].astype(str).str.lower() == sel_origen]
     if sel_tipos:
         pm_f = pm_f[pm_f["TIPO_ATAQUE"].astype(str).isin(sel_tipos)]
-    if q_busqueda:
-        cols_busq = [
-            "POSTMORTEM_ID", "TIPO_ATAQUE", "MITRE_TACTIC",
-            "APLICACIONES_AFECTADAS", "IPS_INVOLUCRADAS", "RESUMEN_EJECUTIVO",
-        ]
-        mask = pd.Series(False, index=pm_f.index)
-        for col in cols_busq:
-            if col in pm_f.columns:
-                mask = mask | pm_f[col].fillna("").astype(str).str.lower().str.contains(q_busqueda, regex=False)
-        pm_f = pm_f[mask]
-
+    if q:
+        cols = ["POSTMORTEM_ID", "TIPO_ATAQUE", "MITRE_TACTIC", "APLICACIONES_AFECTADAS",
+                "IPS_INVOLUCRADAS", "RESUMEN_EJECUTIVO"]
+        texto = pm_f[[c for c in cols if c in pm_f.columns]].fillna("").astype(str) \
+            .agg(" ".join, axis=1).str.lower()
+        pm_f = pm_f[texto.str.contains(q, regex=False)]
     if pm_f.empty:
-        with header_slot:
-            encabezado(
-                "Postmortems SOC",
-                f"Expedientes forenses automatizados (MCP + Gemini) para {MES.replace('_', '-')}",
-                "Triage, diagnóstico y exportación ejecutiva",
-            )
-        vacio("Ningún reporte postmortem coincide con los filtros actuales.")
+        vacio("Ningún reporte coincide con los filtros.")
         return
+    pm_f = pm_f.sort_values(["SEVERIDAD_SCORE", "FECHA_GENERACION"], ascending=False) \
+        .reset_index(drop=True)
 
-    pm_f = pm_f.sort_values(["SEVERIDAD_SCORE", "FECHA_GENERACION"], ascending=[False, False]).reset_index(drop=True)
-
-    # Selección del expediente activo y render en la cabecera superior (Fiori Object Header Actions)
-    opciones = pm_f["POSTMORTEM_ID"].tolist()
-    if st.session_state.get("pm_seleccionado") not in opciones:
-        st.session_state["pm_seleccionado"] = opciones[0]
-    etiquetas = {
-        row["POSTMORTEM_ID"]: (
-            f"{row['POSTMORTEM_ID']} | {row['TIPO_ATAQUE']} | "
-            f"{str(row['STREAM']).upper()} | Sev {float(row['SEVERIDAD_SCORE']):.4f}"
-        )
-        for _, row in pm_f.iterrows()
-    }
-
-    with header_slot:
-        h_left, h_right = st.columns([1.65, 1.35], vertical_alignment="bottom", gap="large")
-        with h_left:
-            encabezado(
-                "Postmortems SOC",
-                f"Expedientes forenses automatizados (MCP + Gemini) para {MES.replace('_', '-')}",
-                "Triage, diagnóstico y exportación ejecutiva",
-            )
-        with h_right:
-            pm_sel = st.selectbox(
-                "Expediente activo para inspección y descarga",
-                opciones,
-                format_func=lambda pid: etiquetas.get(pid, pid),
-                key="pm_seleccionado",
-            )
-            fila_sel = pm_f[pm_f["POSTMORTEM_ID"] == pm_sel].iloc[0]
-            pm_id_sel = str(fila_sel.get("POSTMORTEM_ID") or "PM-N/A")
-            md_sel = str(fila_sel.get("REPORTE_MARKDOWN") or "Sin reporte Markdown registrado.")
-
-            b_pdf, b_md = st.columns([1.3, 1.0], gap="small")
-            with b_pdf:
-                try:
-                    pdf_bytes = _construir_pdf_bytes(fila_sel)
-                    st.download_button(
-                        "Descargar PDF Ejecutivo",
-                        data=pdf_bytes,
-                        file_name=f"{pm_id_sel}.pdf",
-                        mime="application/pdf",
-                        icon=":material/picture_as_pdf:",
-                        type="primary",
-                        width="stretch",
-                    )
-                except Exception as err:
-                    st.warning(f"No se pudo compilar el PDF: {err}")
-            with b_md:
-                st.download_button(
-                    "Markdown (.md)",
-                    data=md_sel.encode("utf-8"),
-                    file_name=f"{pm_id_sel}.md",
-                    mime="text/markdown",
-                    icon=":material/description:",
-                    width="stretch",
-                )
-
-    fila = pm_f[pm_f["POSTMORTEM_ID"] == st.session_state["pm_seleccionado"]].iloc[0]
-
-    # KPIs de respuesta a incidentes
+    # KPIs
     sev_max = float(pm_f["SEVERIDAD_SCORE"].max())
     n_crit = int((pm_f["SEVERIDAD_SCORE"] >= 0.70).sum())
-    tacticas_unicas = int(pm_f["MITRE_TACTIC"].dropna().astype(str).nunique())
-    apps_unicas = sorted({a for v in pm_f["APLICACIONES_AFECTADAS"] for a in _parse_lista_campo(v)})
-    kpis_pm = [
-        ("Postmortems SOC", f"{len(pm_f)}", f"de {len(pm_all)} en {MES.replace('_', '-')}",
-         BRAND, "Expedientes forenses filtrados en SAP HANA Cloud."),
-        ("Severidad máxima (IF)", f"{sev_max:.4f}", f"{n_crit} crítico(s) (>= 0.70)",
-         CRITICO if sev_max >= 0.70 else "#E76500", "Puntuación máxima de anomalía Isolation Forest."),
-        ("Tácticas MITRE", f"{tacticas_unicas}", "vectores mapeados",
-         "#7858FF", "Cobertura de tácticas y técnicas MITRE ATT&CK / ATLAS."),
-        ("Apps / Servicios SAP", f"{len(apps_unicas)}", ", ".join(apps_unicas[:3]) or "N/A",
-         "#049F9A", "Aplicaciones y componentes SAP identificados en la evidencia."),
+    n_tacticas = int(pm_f["MITRE_TACTIC"].dropna().astype(str).nunique())
+    apps = sorted({a for v in pm_f["APLICACIONES_AFECTADAS"] for a in _parse_lista_campo(v)})
+    kpis = [
+        ("Reportes", f"{len(pm_f)}", f"de {len(pm_all)} en el periodo", BRAND,
+         "Reportes forenses que cumplen los filtros."),
+        ("Severidad máxima", f"{sev_max:.2f}", f"{n_crit} crítico(s), 0.70 o más",
+         CRITICO if sev_max >= 0.70 else "#E76500",
+         "Puntuación de anomalía del modelo (de 0 a 1) del reporte más grave."),
+        ("Tácticas MITRE", f"{n_tacticas}", "tácticas distintas", "#7858FF",
+         "Tácticas MITRE ATT&CK / ATLAS asignadas a los incidentes."),
+        ("Aplicaciones SAP", f"{len(apps)}", "afectadas en total", "#049F9A",
+         ", ".join(apps) or "Sin aplicaciones registradas."),
     ]
     st.html('<div class="kpis kpis-4">' + "".join(
-        f'<div class="kpi" style="--c:{c}" title="{ayuda}"><div class="lab"><i></i>{lab}</div>'
+        f'<div class="kpi" style="--c:{c}" title="{html.escape(ayuda)}"><div class="lab"><i></i>{lab}</div>'
         f'<div class="val">{val}</div><div class="det">{det}</div></div>'
-        for lab, val, det, c, ayuda in kpis_pm) + '</div>')
+        for lab, val, det, c, ayuda in kpis) + '</div>')
 
-    # Tabla de triage + gráfica de severidad
-    c1, c2 = st.columns([1.45, 1], gap="medium")
+    # Cola de incidentes (la fila seleccionada define el expediente) y severidad por expediente
+    c1, c2 = st.columns([2, 1], gap="medium")
     with c1, tarjeta("Cola de incidentes investigados",
-                     "Ordenados de mayor a menor severidad Isolation Forest."):
-        st.dataframe(
-            pm_f[["POSTMORTEM_ID", "EVENTO_ID", "STREAM", "TIPO_ATAQUE",
-                  "MITRE_TACTIC", "SEVERIDAD_SCORE", "INICIO"]],
-            hide_index=True,
+                     "Ordenados de mayor a menor severidad. Haz clic en una fila para "
+                     "abrir su expediente."):
+        sel = st.dataframe(
+            pm_f[["POSTMORTEM_ID", "TIPO_ATAQUE", "MITRE_TACTIC"]],
+            hide_index=True, on_select="rerun", selection_mode="single-row", key="pm_tabla",
             column_config={
-                "POSTMORTEM_ID": st.column_config.TextColumn("ID Postmortem"),
-                "EVENTO_ID": st.column_config.NumberColumn("Evento", format="%d", width="small"),
-                "STREAM": st.column_config.TextColumn("Origen", width="small"),
-                "TIPO_ATAQUE": "Vector / Ataque",
-                "MITRE_TACTIC": "MITRE ATT&CK / ATLAS",
-                "SEVERIDAD_SCORE": st.column_config.ProgressColumn(
-                    "Severidad (IF)", format="%.4f", min_value=0.0, max_value=1.0),
-                "INICIO": st.column_config.DatetimeColumn("Inicio", format="DD-MMM HH:mm"),
-            },
-        )
+                "POSTMORTEM_ID": "Expediente",
+                "TIPO_ATAQUE": "Tipo de ataque",
+                "MITRE_TACTIC": "Táctica MITRE",
+            })
+    filas = sel.selection.rows
+    i_sel = filas[0] if filas and filas[0] < len(pm_f) else 0
+    fila = pm_f.iloc[i_sel]
 
     with c2, tarjeta("Severidad por expediente",
-                     "Comparativa de puntuación de anomalía y vector asignado."):
-        fig_pm = go.Figure()
-        pm_ord = pm_f.iloc[::-1]
-        colores_bar = [COLOR_TIPO.get(t, BRAND) for t in pm_ord["TIPO_ATAQUE"]]
-        fig_pm.add_trace(go.Bar(
-            x=pm_ord["SEVERIDAD_SCORE"],
-            y=pm_ord["POSTMORTEM_ID"],
-            orientation="h",
-            marker=dict(color=colores_bar, line=dict(color=SURFACE, width=1.5), cornerradius=4),
-            customdata=np.stack([pm_ord["TIPO_ATAQUE"], pm_ord["STREAM"]], axis=-1),
-            hovertemplate="<b>%{y}</b><br>Vector: %{customdata[0]}<br>"
-                          "Origen: %{customdata[1]}<br>Severidad IF: %{x:.4f}<extra></extra>",
-        ))
-        fig_pm.update_xaxes(title_text="Severidad IF (0 a 1)", title_font_color=MUTED, range=[0, 1.05])
-        fig_pm.update_yaxes(title_text=None)
-        mostrar(estilo(fig_pm, height=280, legend=False))
+                     "Puntuación de anomalía de cada expediente, de 0 a 1. Resaltado, el que está abierto."):
+        orden = pm_f.iloc[::-1]
+        abierto = orden["POSTMORTEM_ID"] == fila["POSTMORTEM_ID"]
+        fig = go.Figure(go.Bar(
+            x=orden["SEVERIDAD_SCORE"], y=orden["POSTMORTEM_ID"], orientation="h",
+            marker=dict(color=[COLOR_TIPO.get(t, BRAND) for t in orden["TIPO_ATAQUE"]],
+                        opacity=[1 if a else .35 for a in abierto], cornerradius=4),
+            text=[f"{v:.2f}" for v in orden["SEVERIDAD_SCORE"]], textposition="outside",
+            textfont=dict(color=INK2, size=11), cliponaxis=False,
+            customdata=orden["TIPO_ATAQUE"],
+            hovertemplate="<b>%{y}</b><br>%{customdata}<br>Severidad %{x:.2f}<extra></extra>"))
+        fig.update_xaxes(range=[0, 1.08], title_text=None)
+        fig.update_yaxes(title_text=None)
+        mostrar(estilo(fig, height=max(200, 44 * len(pm_f) + 50), legend=False,
+                       margin=dict(l=8, r=12, t=8, b=28)))
 
     pm_id = str(fila.get("POSTMORTEM_ID") or "PM-N/A")
-    sev_val = float(fila.get("SEVERIDAD_SCORE") or 0.0)
-    sev_tag, sev_cls, sev_color = _etiqueta_severidad(sev_val)
-    stream_val = str(fila.get("STREAM") or "system").upper()
-    fuente_val = str(fila.get("SOURCE_TABLE") or "N/A")
-    tipo_val = str(fila.get("TIPO_ATAQUE") or "N/A")
-    mitre_val = str(fila.get("MITRE_TACTIC") or "Pendiente")
+    sev = float(fila.get("SEVERIDAD_SCORE") or 0.0)
+    sev_txt, sev_cls, _ = _etiqueta_severidad(sev)
+    origen = STREAMS.get(str(fila.get("STREAM")).lower(), str(fila.get("STREAM")))
     meta = _parse_json_safe(fila.get("METADATA_JSON"))
-    inc_meta = meta.get("incident_meta") or {}
-    z_max_val = float(inc_meta.get("z_max") or 0.0)
-    z_feat_val = str(inc_meta.get("z_max_feature") or "N/A")
-    conf_val = str(inc_meta.get("confianza") or "N/A").upper()
-    n_win_val = int(inc_meta.get("n_ventanas") or 1)
-    apps_list = _parse_lista_campo(fila.get("APLICACIONES_AFECTADAS"))
-    ips_list = _parse_lista_campo(fila.get("IPS_INVOLUCRADAS"))
-    resumen_ej = str(fila.get("RESUMEN_EJECUTIVO") or "Sin resumen ejecutivo registrado.")
-    md_report = str(fila.get("REPORTE_MARKDOWN") or "Sin reporte Markdown registrado.")
+    inc = meta.get("incident_meta") or {}
+    apps_l = _parse_lista_campo(fila.get("APLICACIONES_AFECTADAS"))
+    ips_l = _parse_lista_campo(fila.get("IPS_INVOLUCRADAS"))
+    fecha, horas = _rango(fila.get("INICIO"), fila.get("FIN"))
+    md = str(fila.get("REPORTE_MARKDOWN") or "Sin reporte registrado.")
+    esc = html.escape
 
+    # Expediente del incidente seleccionado
     with tarjeta("Expediente Forense del Incidente",
-                 "Análisis pericial generado por el Agente Forense con telemetría SAP HANA y Gemini."):
+                 "Análisis que generó el agente forense con los registros de SAP HANA."):
+        h1, h2 = st.columns([3, 1], vertical_alignment="center", gap="medium")
+        with h1:
+            st.html(
+                f'<div class="pm-head"><span class="id">{esc(pm_id)}</span>'
+                f'<span class="pm-pill {sev_cls}">Severidad {sev_txt.lower()} · {sev:.2f}</span>'
+                f'<span class="pm-pill brand">{esc(origen)}</span>'
+                f'<span class="pm-pill">Evento {int(fila.get("EVENTO_ID") or 0)}</span></div>'
+                f'<p class="pm-sub"><b>{esc(str(fila.get("TIPO_ATAQUE") or "N/A"))}</b> · '
+                f'{esc(str(fila.get("MITRE_TACTIC") or "Táctica pendiente"))} · '
+                f'{esc(str(fila.get("SOURCE_TABLE") or "N/A"))} · '
+                f'generado el {esc(_fmt_ts(fila.get("FECHA_GENERACION"))[:16])}</p>')
+        with h2, st.container(key="pm_descargas", gap="small"):
+            try:
+                st.download_button("Descargar PDF", data=_construir_pdf_bytes(fila),
+                                   file_name=f"{pm_id}.pdf", mime="application/pdf",
+                                   icon=":material/download:", width="stretch",
+                                   help="Descarga el reporte ejecutivo de este expediente en PDF.")
+            except Exception as err:
+                st.warning(f"No se pudo generar el PDF: {err}")
+            st.download_button("Descargar Markdown", data=md.encode("utf-8"),
+                               file_name=f"{pm_id}.md", mime="text/markdown",
+                               icon=":material/download:", width="stretch",
+                               help="Descarga el reporte completo de este expediente en Markdown.")
+
+        z_feat = str(inc.get("z_max_feature") or "N/A")
         st.html(
-            f'<div class="pm-banner" style="--c:{sev_color}">'
-            f'  <div>'
-            f'    <h3>{html.escape(pm_id)} — {html.escape(tipo_val)}</h3>'
-            f'    <p class="pm-sub">MITRE: <strong>{html.escape(mitre_val)}</strong> &nbsp;|&nbsp; '
-            f'       Dataset: <strong>{html.escape(fuente_val)}</strong> &nbsp;|&nbsp; '
-            f'       Generado: {html.escape(_fmt_ts(fila.get("FECHA_GENERACION")))}</p>'
-            f'  </div>'
-            f'  <div class="pm-pills">'
-            f'    <span class="pm-pill {sev_cls}">{sev_tag} IF {sev_val:.4f}</span>'
-            f'    <span class="pm-pill brand">STREAM: {html.escape(stream_val)}</span>'
-            f'    <span class="pm-pill">EVENTO #{int(fila.get("EVENTO_ID") or 0)}</span>'
-            f'  </div>'
-            f'</div>'
-        )
+            '<div class="pm-meta">'
+            f'<div><p class="lbl">Cuándo</p><div class="val">{esc(fecha)}</div>'
+            f'<div class="det">{esc(horas)}</div></div>'
+            f'<div><p class="lbl">Indicador más afectado</p><div class="val">{esc(nombre(z_feat))}</div>'
+            f'<div class="det">Intensidad {float(inc.get("z_max") or 0):.1f}</div></div>'
+            f'<div><p class="lbl">Bloques atípicos</p><div class="val">{int(inc.get("n_ventanas") or 1)}</div>'
+            f'<div class="det">Confianza {esc(str(inc.get("confianza") or "N/A"))}</div></div>'
+            f'<div><p class="lbl">Alcance</p><div class="val">{len(apps_l)} aplicación(es)</div>'
+            f'<div class="det">{len(ips_l)} IP(s) involucradas</div></div>'
+            '</div>')
+        st.html(f'<div class="pm-callout"><b>Resumen ejecutivo</b>'
+                f'{esc(str(fila.get("RESUMEN_EJECUTIVO") or "Sin resumen registrado."))}</div>')
 
-        st.html(
-            f'<div class="pm-meta-grid">'
-            f'  <div class="pm-meta-item"><div class="lbl">Ventana Temporal</div>'
-            f'    <div class="val">{html.escape(_fmt_ts(fila.get("INICIO")))} -> {html.escape(_fmt_ts(fila.get("FIN")))}</div></div>'
-            f'  <div class="pm-meta-item"><div class="lbl">Métrica Más Desviada</div>'
-            f'    <div class="val">{html.escape(z_feat_val)} (Z = {z_max_val:.2f})</div></div>'
-            f'  <div class="pm-meta-item"><div class="lbl">Ventanas & Confianza</div>'
-            f'    <div class="val">{n_win_val} bloque(s) | Confianza {html.escape(conf_val)}</div></div>'
-            f'  <div class="pm-meta-item"><div class="lbl">Alcance Detectado</div>'
-            f'    <div class="val">{len(apps_list)} app(s) | {len(ips_list)} IP(s)</div></div>'
-            f'</div>'
-        )
-
-        st.html(
-            f'<div class="pm-callout"><b>Dictamen Forense Ejecutivo</b>'
-            f'{html.escape(resumen_ej)}</div>'
-        )
-
-        tab_md, tab_ev = st.tabs([
-            "Reporte Forense Completo",
-            "Activos SAP, IPs y Evidencia MCP",
-        ])
-        with tab_md:
-            st.markdown(md_report)
-        with tab_ev:
-            ev_c1, ev_c2 = st.columns(2, gap="medium")
-            with ev_c1:
-                st.markdown("**Aplicaciones y servicios SAP afectados**")
-                if apps_list:
-                    st.html('<div class="pm-chips">' + "".join(
-                        f'<span class="pm-chip">{html.escape(a)}</span>' for a in apps_list
-                    ) + '</div>')
-                else:
-                    st.caption("Sin aplicaciones específicas registradas.")
-            with ev_c2:
-                st.markdown("**Direcciones IP involucradas**")
-                if ips_list:
-                    st.html('<div class="pm-chips">' + "".join(
-                        f'<span class="pm-chip">{html.escape(ip)}</span>' for ip in ips_list
-                    ) + '</div>')
-                else:
-                    st.caption("Tráfico interno / sin IPs externas asociadas.")
-
-            st.divider()
-            logs_sample = (
-                meta.get("evidence_logs_sample")
-                or (meta.get("raw_evidence") or {}).get("logs_muestra")
-                or []
-            )
-            st.markdown("**Muestra de telemetría cruda recuperada vía MCP**")
-            if logs_sample and isinstance(logs_sample, list):
-                st.dataframe(pd.DataFrame(logs_sample))
+        t1, t2 = st.tabs(["Reporte completo", "Evidencia"])
+        with t1, st.container(key="pm_reporte"):
+            st.markdown(_sin_titulo(md))
+        with t2:
+            st.html(
+                '<div class="pm-meta dos">'
+                f'<div><p class="lbl">Aplicaciones SAP afectadas</p>'
+                f'{_chips(apps_l, "Sin aplicaciones registradas.")}</div>'
+                f'<div><p class="lbl">Direcciones IP involucradas</p>'
+                f'{_chips(ips_l, "Sin IPs externas asociadas.")}</div>'
+                '</div>')
+            logs = (meta.get("evidence_logs_sample")
+                    or (meta.get("raw_evidence") or {}).get("logs_muestra") or [])
+            st.html('<p class="card-title">Muestra de registros</p>'
+                    '<p class="card-sub">Registros originales que el agente consultó en SAP HANA.</p>')
+            if logs and isinstance(logs, list):
+                st.dataframe(pd.DataFrame(logs), hide_index=True)
             else:
-                st.caption("No hay muestra de logs crudos embebida en METADATA_JSON para este expediente.")
-
-            with st.expander("Inspeccionar METADATA_JSON completa"):
-                st.json(meta if meta else {"nota": "METADATA_JSON vacía o no estructurada"})
+                vacio("Este reporte no incluye una muestra de registros.")
+            with st.expander("Ver metadatos completos (JSON)"):
+                st.json(meta or {"nota": "Sin metadatos."})
 
 
 # Navegación
