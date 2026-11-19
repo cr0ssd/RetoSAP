@@ -49,18 +49,26 @@ class HanaMcpTools:
     # --------------------------------------------------------------------------
     # Tool 1: get_candidate_incidents
     # --------------------------------------------------------------------------
-    def get_candidate_incidents(self, mes: str, stream: Optional[str] = None, top_k: int = 5) -> List[Dict[str, Any]]:
+    def get_candidate_incidents(
+        self,
+        mes: str,
+        stream: Optional[str] = None,
+        top_k: Optional[int] = None,
+    ) -> List[Dict[str, Any]]:
         """
-        Consulta los incidentes de seguridad mas criticos de la tabla RESULT_EVENTS_<mes>.
-        Filtra RELEVANTE == 1 y excluye clasificaciones de no-ataque.
+        Consulta y deduplica multi-escala los incidentes relevantes de RESULT_EVENTS_<mes>.
+        Filtra RELEVANTE == 1, excluye clasificaciones de no-ataque (Falla operativa) y
+        consolida eventos del mismo (STREAM, TIPO_ATAQUE) cuyos intervalos temporales
+        reales [INICIO, FIN + WINDOW_SIZE_S] se traslapan entre distintas longitudes de ventana
+        (5min, 15min, 30min, 1h, 3h), preservando ataques que solo emergen en ventanas largas.
         """
         tabla_eventos = f"RESULT_EVENTS_{mes}"
         cond_stream = f"AND STREAM = '{stream}'" if stream else ""
-        
+
         sql = f"""
-        SELECT EVENTO_ID, STREAM, SOURCE_TABLE, WEEK, INICIO, FIN, N_VENTANAS,
-               VENTANA_PICO, SCORE_PICO, Z_MAX, Z_MAX_FEATURE, RELEVANTE,
-               TIPO_ATAQUE, MARGEN, CONFIANZA, TOP3
+        SELECT EVENTO_ID, STREAM, SOURCE_TABLE, WINDOW_SIZE_S, WINDOW_LABEL,
+               WEEK, INICIO, FIN, N_VENTANAS, VENTANA_PICO, SCORE_PICO,
+               Z_MAX, Z_MAX_FEATURE, RELEVANTE, TIPO_ATAQUE, MARGEN, CONFIANZA, TOP3
         FROM {tabla_eventos}
         WHERE RELEVANTE = 1
           {cond_stream}
@@ -80,39 +88,105 @@ class HanaMcpTools:
         if df_ataques.empty:
             df_ataques = df.copy()
 
-        candidatos = []
-        for _, row in df_ataques.head(top_k).iterrows():
-            candidatos.append({
+        df_ataques['_INICIO_DT'] = pd.to_datetime(df_ataques['INICIO'])
+        df_ataques['_FIN_REAL_DT'] = (
+            pd.to_datetime(df_ataques['FIN'])
+            + pd.to_timedelta(df_ataques['WINDOW_SIZE_S'].fillna(300).astype(int), unit='s')
+        )
+
+        orden_escalas = {'5min': 1, '15min': 2, '30min': 3, '1h': 4, '3h': 5}
+        grupos: List[Dict[str, Any]] = []
+
+        for _, row in df_ataques.iterrows():
+            st_val = str(row['STREAM'])
+            tipo_val = str(row['TIPO_ATAQUE']) if pd.notna(row['TIPO_ATAQUE']) else 'Indeterminado'
+            ini_dt = row['_INICIO_DT']
+            fin_dt = row['_FIN_REAL_DT']
+            w_size = int(row['WINDOW_SIZE_S']) if pd.notna(row['WINDOW_SIZE_S']) else 300
+            w_label = str(row['WINDOW_LABEL']) if pd.notna(row['WINDOW_LABEL']) else f"{w_size // 60}min"
+
+            grupos.append({
                 'evento_id': int(row['EVENTO_ID']),
-                'stream': str(row['STREAM']),
+                'stream': st_val,
                 'source_table': str(row['SOURCE_TABLE']),
+                'window_size_s': w_size,
+                'window_label': w_label,
+                'escalas_detectadas': [w_label],
                 'week': int(row['WEEK']) if pd.notna(row['WEEK']) else None,
                 'inicio': str(row['INICIO']),
-                'fin': str(row['FIN']),
+                'fin': str(fin_dt),
+                '_ini_dt': ini_dt,
+                '_fin_dt': fin_dt,
                 'n_ventanas': int(row['N_VENTANAS']),
                 'ventana_pico': str(row['VENTANA_PICO']),
                 'score_pico': float(row['SCORE_PICO']) if pd.notna(row['SCORE_PICO']) else 0.0,
                 'z_max': float(row['Z_MAX']) if pd.notna(row['Z_MAX']) else 0.0,
                 'z_max_feature': str(row['Z_MAX_FEATURE']) if pd.notna(row['Z_MAX_FEATURE']) else 'N/A',
-                'tipo_ataque': str(row['TIPO_ATAQUE']) if pd.notna(row['TIPO_ATAQUE']) else 'Indeterminado',
+                'tipo_ataque': tipo_val,
                 'confianza': str(row['CONFIANZA']) if pd.notna(row['CONFIANZA']) else 'baja',
-                'top3': str(row['TOP3']) if pd.notna(row['TOP3']) else ''
+                'top3': str(row['TOP3']) if pd.notna(row['TOP3']) else '',
             })
-        return candidatos
+
+        # Clausura transitiva de traslape temporal para (stream, tipo_ataque)
+        hubo_fusion = True
+        while hubo_fusion:
+            hubo_fusion = False
+            nuevos: List[Dict[str, Any]] = []
+            for item in grupos:
+                fusionado = False
+                for g in nuevos:
+                    if g['stream'] == item['stream'] and g['tipo_ataque'] == item['tipo_ataque']:
+                        if g['_ini_dt'] <= item['_fin_dt'] and g['_fin_dt'] >= item['_ini_dt']:
+                            g['_ini_dt'] = min(g['_ini_dt'], item['_ini_dt'])
+                            g['_fin_dt'] = max(g['_fin_dt'], item['_fin_dt'])
+                            g['inicio'] = str(g['_ini_dt'])
+                            g['fin'] = str(g['_fin_dt'])
+                            for esc in item['escalas_detectadas']:
+                                if esc not in g['escalas_detectadas']:
+                                    g['escalas_detectadas'].append(esc)
+                            if item['z_max'] > g['z_max']:
+                                g['z_max'] = item['z_max']
+                                g['z_max_feature'] = item['z_max_feature']
+                            fusionado = True
+                            hubo_fusion = True
+                            break
+                if not fusionado:
+                    nuevos.append(item)
+            grupos = nuevos
+
+        for g in grupos:
+            g['escalas_detectadas'] = sorted(
+                g['escalas_detectadas'],
+                key=lambda s: orden_escalas.get(s, 99),
+            )
+            g.pop('_ini_dt', None)
+            g.pop('_fin_dt', None)
+
+        if top_k is not None and top_k > 0:
+            return grupos[:top_k]
+        return grupos
 
     # --------------------------------------------------------------------------
     # Tool 2: get_incident_windows_telemetry
     # --------------------------------------------------------------------------
-    def get_incident_windows_telemetry(self, mes: str, stream: str, evento_id: int) -> Dict[str, Any]:
+    def get_incident_windows_telemetry(
+        self,
+        mes: str,
+        stream: str,
+        evento_id: int,
+        window_size_s: Optional[int] = None,
+    ) -> Dict[str, Any]:
         """
         Obtiene las ventanas asociadas al incidente desde RESULT_WINDOWS_<STREAM>_<mes>.
-        Calcula metricas agregadas para contextualizar la dimension del impacto.
+        Filtra por EVENTO_ID y WINDOW_SIZE_S para no mezclar resoluciones distintas.
         """
         tabla_ventanas = f"RESULT_WINDOWS_{stream.upper()}_{mes}"
+        cond_win = f"AND WINDOW_SIZE_S = {int(window_size_s)}" if window_size_s is not None else ""
         sql = f"""
         SELECT *
         FROM {tabla_ventanas}
         WHERE EVENTO_ID = {evento_id}
+          {cond_win}
         ORDER BY WINDOW_START ASC
         """
         try:
@@ -163,8 +237,8 @@ class HanaMcpTools:
         cols_query = """
             "TIMESTAMP", "SAP_FUNCTION_APPLICATION", "CLIENT_IP", "HTTP_STATUS_CODE",
             "HEATHERS_REQUEST_PATH", "SAP_FUNCTION_MESSAGE", "SAP_FUNCTION_LOG_TYPE",
-            "LLM_PROMPT", "LLM_RESPONSE", "LLM_STATUS", "LLM_ERROR_MESSAGE",
-            "LLM_MODEL", "LLM_TOTAL_TOKENS", "LLM_TOTAL_COST_USD"
+            "LLM_PROMPT", "LLM_PROMPT_CATEGORY", "LLM_STATUS", "LLM_ERROR_MESSAGE",
+            "LLM_MODEL_ID", "LLM_TOTAL_TOKENS", "LLM_COST_USD"
         """
 
         # Filtro adicional segun stream para capturar evidencia real
@@ -174,10 +248,20 @@ class HanaMcpTools:
         else:
             filtro_extra = "AND (HTTP_STATUS_CODE >= 400 OR SAP_FUNCTION_LOG_TYPE IN ('ERROR', 'SECURITY', 'WARN'))"
 
+        try:
+            ini_iso = pd.to_datetime(inicio).strftime('%Y-%m-%dT%H:%M:%S')
+            fin_iso = pd.to_datetime(fin).strftime('%Y-%m-%dT%H:%M:%S.999Z')
+            cond_ts = (
+                f'(("TIMESTAMP" >= \'{ini_iso}\' AND "TIMESTAMP" <= \'{fin_iso}\') '
+                f'OR ("TIMESTAMP" >= \'{inicio}\' AND "TIMESTAMP" <= \'{fin}\'))'
+            )
+        except Exception:
+            cond_ts = f'"TIMESTAMP" >= \'{inicio}\' AND "TIMESTAMP" <= \'{fin}\''
+
         sql = f"""
         SELECT {cols_query}
         FROM "{source_table}"
-        WHERE "TIMESTAMP" >= '{inicio}' AND "TIMESTAMP" <= '{fin}'
+        WHERE {cond_ts}
           {filtro_extra}
         ORDER BY "TIMESTAMP" ASC
         LIMIT {limit}
@@ -191,7 +275,7 @@ class HanaMcpTools:
             sql_fallback = f"""
             SELECT {cols_query}
             FROM "{source_table}"
-            WHERE "TIMESTAMP" >= '{inicio}' AND "TIMESTAMP" <= '{fin}'
+            WHERE {cond_ts}
             ORDER BY "TIMESTAMP" ASC
             LIMIT {limit}
             """
@@ -262,6 +346,12 @@ class HanaMcpTools:
                 log.info("[DB] Creando tabla oficial de postmortems: %s", tabla_pm)
                 cur.execute(ddl)
                 self.conn.connection.commit()
+            else:
+                try:
+                    cur.execute(f'ALTER TABLE "{tabla_pm}" ALTER ("RESUMEN_EJECUTIVO" NVARCHAR(3000))')
+                    self.conn.connection.commit()
+                except Exception:
+                    pass
             cur.close()
         except Exception as e:
             log.warning("[WARN] Verificacion DDL de %s: %s", tabla_pm, e)
@@ -306,4 +396,41 @@ class HanaMcpTools:
             return True
         except Exception as e:
             log.error("[ERROR] Fallo al hacer UPSERT de %s en %s: %s", pm_id, tabla_pm, e)
+            return False
+
+    def get_existing_postmortem_ids(self, mes: str) -> set:
+        """Retorna el conjunto de POSTMORTEM_ID ya persistidos en RESULT_POSTMORTEMS_<mes>."""
+        tabla_pm = f"RESULT_POSTMORTEMS_{mes}"
+        try:
+            cur = self.conn.connection.cursor()
+            cur.execute(
+                f"SELECT TABLE_NAME FROM SYS.TABLES WHERE SCHEMA_NAME = CURRENT_SCHEMA AND TABLE_NAME = '{tabla_pm}'"
+            )
+            if not cur.fetchone():
+                cur.close()
+                return set()
+            cur.execute(f'SELECT "POSTMORTEM_ID" FROM "{tabla_pm}"')
+            ids = {str(r[0]) for r in cur.fetchall()}
+            cur.close()
+            return ids
+        except Exception as e:
+            log.warning("[WARN] No se pudieron leer IDs existentes de %s: %s", tabla_pm, e)
+            return set()
+
+    def clear_postmortems_for_month(self, mes: str) -> bool:
+        """Limpia los registros existentes de RESULT_POSTMORTEMS_<mes> antes de una regeneracion limpia."""
+        tabla_pm = f"RESULT_POSTMORTEMS_{mes}"
+        try:
+            cur = self.conn.connection.cursor()
+            cur.execute(
+                f"SELECT TABLE_NAME FROM SYS.TABLES WHERE SCHEMA_NAME = CURRENT_SCHEMA AND TABLE_NAME = '{tabla_pm}'"
+            )
+            if cur.fetchone():
+                cur.execute(f'DELETE FROM "{tabla_pm}"')
+                self.conn.connection.commit()
+                log.info("[DB] Tabla %s limpiada para regeneracion completa.", tabla_pm)
+            cur.close()
+            return True
+        except Exception as e:
+            log.warning("[WARN] No se pudo limpiar %s: %s", tabla_pm, e)
             return False
