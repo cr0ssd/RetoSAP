@@ -1,0 +1,8 @@
+hana-ml==2.30.26091800
+hdbcli==2.30.27
+numpy>=2.0.0
+pandas>=2.2.0
+plotly>=6.0.0
+python-dotenv>=1.0.0
+reportlab>=4.0.0
+streamlit>=1.50.0
