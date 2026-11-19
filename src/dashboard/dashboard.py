@@ -20,7 +20,11 @@ import streamlit as st
 
 import hana_ml.dataframe as hana_df
 
-from generador_pdf_postmortem import generar_pdf_postmortem, generar_pdf_postmortem_mensual
+from generador_pdf_postmortem import (
+    generar_pdf_postmortem,
+    generar_pdf_postmortem_mensual,
+    _clasificar_severidad_incidente,
+)
 from helpers.conexion import _params
 from helpers.explicacion import FAMILIAS_SYSTEM, FAMILIAS_LLM, zscores, perfil_familias
 from helpers.clasificacion import FIRMAS, TIPOS_NO_ATAQUE
@@ -506,19 +510,13 @@ def _construir_markdown_mensual(df_pm, periodo):
         "",
         "## 2. Cronologia Maestra de Incidentes del Periodo",
         "",
-        "| Expediente | Origen | Vector / Ataque | Ventana Temporal (UTC) | Escalas | Indicador (Z) |",
-        "| :--- | :--- | :--- | :--- | :--- | :--- |",
+        "| Expediente | Origen | Vector / Ataque | Ventana Temporal (UTC) |",
+        "| :--- | :--- | :--- | :--- |",
     ])
     for _, r in df_pm.iterrows():
-        m = _parse_json_safe(r.get("METADATA_JSON"))
-        inc = m.get("incident_meta") or {}
-        esc_s = ", ".join(_escalas_de_meta(m))
-        zf = str(inc.get("z_max_feature") or "N/A")
-        zv = float(inc.get("z_max") or 0.0)
         lineas.append(
             f"| **{r.get('POSTMORTEM_ID', 'N/A')}** | {str(r.get('STREAM', '')).upper()} | "
-            f"{r.get('TIPO_ATAQUE', 'N/A')} | {_fmt_ts(r.get('INICIO'))[:16]} -> {_fmt_ts(r.get('FIN'))[:16]} | "
-            f"{esc_s} | {zf} (Z={zv:.1f}) |"
+            f"{r.get('TIPO_ATAQUE', 'N/A')} | {_fmt_ts(r.get('INICIO'))[:16]} -> {_fmt_ts(r.get('FIN'))[:16]} |"
         )
 
     lineas.extend(["", "## 3. Sintesis Forense Unificada por Campana", ""])
@@ -526,10 +524,13 @@ def _construir_markdown_mensual(df_pm, periodo):
         lineas.append(f"### Campana: {vec} ({len(g)} incidente(s))")
         for _, r in g.iterrows():
             m = _parse_json_safe(r.get("METADATA_JSON"))
-            esc_s = ", ".join(_escalas_de_meta(m))
+            inc = m.get("incident_meta") or {}
+            zv = float(inc.get("z_max") or 0.0)
+            sev_s = float(r.get("SEVERIDAD_SCORE") or 0.0)
+            sev_lbl, _, _ = _clasificar_severidad_incidente(zv, sev_s)
             lineas.append(
                 f"- **{r.get('POSTMORTEM_ID', 'N/A')}** (`{_fmt_ts(r.get('INICIO'))[:16]} -> {_fmt_ts(r.get('FIN'))[:16]}`, "
-                f"escalas: `{esc_s}`): {r.get('RESUMEN_EJECUTIVO', '')}"
+                f"severidad: **{sev_lbl}**): {r.get('RESUMEN_EJECUTIVO', '')}"
             )
         lineas.append("")
     return "\n".join(lineas)
