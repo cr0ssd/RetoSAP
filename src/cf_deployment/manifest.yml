@@ -2,7 +2,7 @@
 applications:
 - name: sap-soc-cron-worker
   memory: 768M
-  disk_quota: 1024M
+  disk_quota: 2048M
   instances: 1
   buildpacks:
   - python_buildpack
@@ -12,6 +12,5 @@ applications:
   env:
     CRON_INTERVAL_MINUTES: "60"
     TABLA_DEFAULT: "LOGS_BATCH_1"
-    GEMINI_API_KEY: ""
-    GEMINI_MODEL: "gemini-3.5-flash"
+    GEMINI_MODEL: "gemini-3.5-flash-lite"
 
