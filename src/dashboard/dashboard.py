@@ -20,7 +20,7 @@ import streamlit as st
 
 import hana_ml.dataframe as hana_df
 
-from generador_pdf_postmortem import generar_pdf_postmortem
+from generador_pdf_postmortem import generar_pdf_postmortem, generar_pdf_postmortem_mensual
 from helpers.conexion import _params
 from helpers.explicacion import FAMILIAS_SYSTEM, FAMILIAS_LLM, zscores, perfil_familias
 from helpers.clasificacion import FIRMAS, TIPOS_NO_ATAQUE
@@ -151,7 +151,8 @@ st.html(f"""
   .kpis {{ display: grid; grid-template-columns: repeat(5, minmax(0, 1fr)); gap: .85rem;
       margin-bottom: 1rem; }}
   .kpis.kpis-4 {{ grid-template-columns: repeat(4, minmax(0, 1fr)); }}
-  @media (max-width: 1000px) {{ .kpis, .kpis.kpis-4 {{ grid-template-columns: repeat(2, minmax(0, 1fr)); }} }}
+  .kpis.kpis-3 {{ grid-template-columns: repeat(3, minmax(0, 1fr)); }}
+  @media (max-width: 1000px) {{ .kpis, .kpis.kpis-4, .kpis.kpis-3 {{ grid-template-columns: repeat(2, minmax(0, 1fr)); }} }}
   .kpi {{ background: {SURFACE}; border: 1px solid {CARD_BORDER}; border-top: 4px solid var(--c);
       border-radius: 14px; padding: .85rem 1rem .9rem; box-shadow: {SOMBRA}; overflow: hidden; }}
   .kpi .lab {{ display: flex; align-items: center; gap: .45rem; font-size: .8rem; color: {MUTED};
@@ -416,8 +417,8 @@ def _fmt_ts(val):
     return str(val)
 
 
-def _construir_pdf_bytes(fila):
-    """Construye en memoria el reporte ejecutivo PDF a partir de una fila HANA."""
+def _fila_a_payload(fila):
+    """Normaliza una fila de RESULT_POSTMORTEMS_<MES> al dict esperado por el generador PDF."""
     meta = _parse_json_safe(fila.get("METADATA_JSON"))
     inc = dict(meta.get("incident_meta") or {})
     inc["z_max"] = float(inc.get("z_max") or 0.0)
@@ -429,7 +430,7 @@ def _construir_pdf_bytes(fila):
     meta_norm = dict(meta)
     meta_norm["incident_meta"] = inc
 
-    payload = {
+    return {
         "postmortem_id": str(fila.get("POSTMORTEM_ID") or "PM-N/A"),
         "evento_id": int(fila.get("EVENTO_ID") or 0),
         "stream": str(fila.get("STREAM") or "system").lower(),
@@ -444,9 +445,94 @@ def _construir_pdf_bytes(fila):
         "reporte_markdown": str(fila.get("REPORTE_MARKDOWN") or ""),
         "metadata_json": meta_norm,
     }
+
+
+def _construir_pdf_bytes(fila):
+    """Construye en memoria el reporte ejecutivo PDF individual a partir de una fila HANA."""
     buf = io.BytesIO()
-    generar_pdf_postmortem(payload, buf)
+    generar_pdf_postmortem(_fila_a_payload(fila), buf)
     return buf.getvalue()
+
+
+def _construir_pdf_mensual_bytes(df_pm, periodo):
+    """Construye en memoria el reporte PDF multi-pagina consolidado para todos los incidentes."""
+    items = [_fila_a_payload(row) for _, row in df_pm.iterrows()]
+    buf = io.BytesIO()
+    generar_pdf_postmortem_mensual(items, periodo, buf)
+    return buf.getvalue()
+
+
+def _escalas_de_meta(meta):
+    """Extrae las escalas de ventana detectadas de METADATA_JSON."""
+    inc = (meta or {}).get("incident_meta") or {}
+    esc = (
+        (meta or {}).get("escalas_detectadas")
+        or inc.get("escalas_detectadas")
+        or ([str(inc["window_label"])] if inc.get("window_label") else ["5min"])
+    )
+    return [str(x) for x in esc if str(x).strip()]
+
+
+def _construir_markdown_mensual(df_pm, periodo):
+    """Construye el Dossier Forense Mensual Unificado en Markdown agrupado por campana."""
+    orden_esc = {"5min": 1, "15min": 2, "30min": 3, "1h": 4, "3h": 5}
+    lineas = [
+        f"# DOSSIER FORENSE POSTMORTEM MENSUAL — PERIODO {periodo}",
+        f"**Total de incidentes unicos multi-escala:** {len(df_pm)}",
+        "",
+        "## 1. Resumen por Campana / Familia de Amenaza",
+        "",
+        "| Campana / Vector | Origen | Tactica MITRE | Incidentes | Escalas Detectadas | Indicador Dominante |",
+        "| :--- | :--- | :--- | ---: | :--- | :--- |",
+    ]
+    grupos = sorted(df_pm.groupby("TIPO_ATAQUE"), key=lambda kv: (-len(kv[1]), str(kv[0])))
+    for vec, g in grupos:
+        st_vec = ", ".join(sorted(g["STREAM"].dropna().astype(str).str.upper().unique()))
+        mitre_v = str(g["MITRE_TACTIC"].iloc[0] or "N/A")
+        escs = set()
+        best_f, best_z = "N/A", 0.0
+        for _, r in g.iterrows():
+            m = _parse_json_safe(r.get("METADATA_JSON"))
+            for e in _escalas_de_meta(m):
+                escs.add(e)
+            inc = m.get("incident_meta") or {}
+            z = float(inc.get("z_max") or 0.0)
+            if z >= best_z:
+                best_z, best_f = z, str(inc.get("z_max_feature") or "N/A")
+        esc_s = ", ".join(sorted(escs, key=lambda s: orden_esc.get(s, 99)))
+        lineas.append(f"| **{vec}** | {st_vec} | {mitre_v} | {len(g)} | {esc_s} | {best_f} (Z={best_z:.1f}) |")
+
+    lineas.extend([
+        "",
+        "## 2. Cronologia Maestra de Incidentes del Periodo",
+        "",
+        "| Expediente | Origen | Vector / Ataque | Ventana Temporal (UTC) | Escalas | Indicador (Z) |",
+        "| :--- | :--- | :--- | :--- | :--- | :--- |",
+    ])
+    for _, r in df_pm.iterrows():
+        m = _parse_json_safe(r.get("METADATA_JSON"))
+        inc = m.get("incident_meta") or {}
+        esc_s = ", ".join(_escalas_de_meta(m))
+        zf = str(inc.get("z_max_feature") or "N/A")
+        zv = float(inc.get("z_max") or 0.0)
+        lineas.append(
+            f"| **{r.get('POSTMORTEM_ID', 'N/A')}** | {str(r.get('STREAM', '')).upper()} | "
+            f"{r.get('TIPO_ATAQUE', 'N/A')} | {_fmt_ts(r.get('INICIO'))[:16]} -> {_fmt_ts(r.get('FIN'))[:16]} | "
+            f"{esc_s} | {zf} (Z={zv:.1f}) |"
+        )
+
+    lineas.extend(["", "## 3. Sintesis Forense Unificada por Campana", ""])
+    for vec, g in grupos:
+        lineas.append(f"### Campana: {vec} ({len(g)} incidente(s))")
+        for _, r in g.iterrows():
+            m = _parse_json_safe(r.get("METADATA_JSON"))
+            esc_s = ", ".join(_escalas_de_meta(m))
+            lineas.append(
+                f"- **{r.get('POSTMORTEM_ID', 'N/A')}** (`{_fmt_ts(r.get('INICIO'))[:16]} -> {_fmt_ts(r.get('FIN'))[:16]}`, "
+                f"escalas: `{esc_s}`): {r.get('RESUMEN_EJECUTIVO', '')}"
+            )
+        lineas.append("")
+    return "\n".join(lineas)
 
 
 def perfil_relevantes(win, rel, familias):
@@ -673,16 +759,14 @@ def pagina_resumen():
                 })
 
     if not pm_all.empty:
-        n_crit = int((pm_all["SEVERIDAD_SCORE"] >= 0.70).sum())
+        n_tipos_pm = int(pm_all["TIPO_ATAQUE"].dropna().astype(str).nunique())
         with tarjeta("Reportes forenses",
                      "Reportes que generó el agente forense para los eventos relevantes del periodo."):
             k1, k2 = st.columns([4, 1], vertical_alignment="center", gap="medium")
             with k1:
                 st.html('<div class="pm-chips">'
-                        f'<span class="pm-chip">{len(pm_all)} reporte(s)</span>'
-                        f'<span class="pm-chip">{n_crit} de severidad crítica</span>'
-                        f'<span class="pm-chip">Severidad máxima '
-                        f'{float(pm_all["SEVERIDAD_SCORE"].max()):.2f}</span></div>')
+                        f'<span class="pm-chip">{len(pm_all)} reporte(s) en el periodo</span>'
+                        f'<span class="pm-chip">{n_tipos_pm} tipo(s) de ataque</span></div>')
             with k2:
                 st.page_link(pg_postmortems, label="Ver reportes", icon=":material/arrow_forward:")
 
@@ -864,14 +948,15 @@ def _chips(items, vacio_txt):
 
 def pagina_postmortems():
     periodo = MES.replace("_", "-")
-    encabezado("Postmortems SOC", "Reportes forenses de los incidentes",
-               "Cada reporte explica un evento relevante: qué pasó, cuándo, qué afectó y qué hacer. "
-               "Selecciona uno en la tabla para ver su detalle y descargarlo.",
-               pills=[("Periodo", periodo), ("Reportes", len(pm_all))])
     if pm_all.empty:
+        encabezado("Postmortems SOC", f"Resumen forense mensual — {periodo}",
+                   "Consolidado ejecutivo de todos los incidentes investigados en el periodo.",
+                   pills=[("Periodo", periodo), ("Reportes", 0)])
         vacio(f"Aún no hay reportes para {periodo}. Aparecerán aquí cuando el agente forense "
               "(cron_job_worker.py) procese los eventos relevantes del periodo.")
         return
+
+    header_slot = st.container()
 
     # Filtros
     with tarjeta():
@@ -897,141 +982,238 @@ def pagina_postmortems():
             .agg(" ".join, axis=1).str.lower()
         pm_f = pm_f[texto.str.contains(q, regex=False)]
     if pm_f.empty:
+        with header_slot:
+            encabezado("Postmortems SOC", f"Resumen forense mensual — {periodo}",
+                       "Consolidado ejecutivo de todos los incidentes investigados en el periodo.",
+                       pills=[("Periodo", periodo), ("Reportes", len(pm_all))])
         vacio("Ningún reporte coincide con los filtros.")
         return
-    pm_f = pm_f.sort_values(["SEVERIDAD_SCORE", "FECHA_GENERACION"], ascending=False) \
+
+    pm_f = pm_f.sort_values(["INICIO", "EVENTO_ID"], ascending=[True, True]) \
         .reset_index(drop=True)
 
-    # KPIs
-    sev_max = float(pm_f["SEVERIDAD_SCORE"].max())
-    n_crit = int((pm_f["SEVERIDAD_SCORE"] >= 0.70).sum())
+    # Cabecera con botones globales de descarga del reporte mensual consolidado
+    with header_slot:
+        h_left, h_right = st.columns([1.85, 1.15], vertical_alignment="bottom", gap="large")
+        with h_left:
+            encabezado("Postmortems SOC", f"Resumen forense mensual — {periodo}",
+                       "Resumen consolidado de todos los incidentes investigados del mes y "
+                       "exportación ejecutiva multipágina.",
+                       pills=[("Periodo", periodo), ("Incidentes", len(pm_f))])
+        with h_right:
+            b1, b2 = st.columns([1.2, 1.0], gap="small")
+            with b1:
+                try:
+                    pdf_mes = _construir_pdf_mensual_bytes(pm_f, periodo)
+                    st.download_button(
+                        "Descargar PDF del Mes",
+                        data=pdf_mes,
+                        file_name=f"Postmortem_SOC_{MES}.pdf",
+                        mime="application/pdf",
+                        icon=":material/picture_as_pdf:",
+                        type="primary",
+                        width="stretch",
+                        help="Genera el PDF ejecutivo multipágina con el resumen del mes y el detalle de cada incidente.",
+                    )
+                except Exception as err:
+                    st.warning(f"No se pudo generar el PDF consolidado: {err}")
+            with b2:
+                md_mes = _construir_markdown_mensual(pm_f, periodo)
+                st.download_button(
+                    "Markdown (.md)",
+                    data=md_mes.encode("utf-8"),
+                    file_name=f"Postmortem_SOC_{MES}.md",
+                    mime="text/markdown",
+                    icon=":material/description:",
+                    width="stretch",
+                    help="Descarga el consolidado completo del mes en Markdown.",
+                )
+
+    # KPIs del periodo (sin severidad)
     n_tacticas = int(pm_f["MITRE_TACTIC"].dropna().astype(str).nunique())
     apps = sorted({a for v in pm_f["APLICACIONES_AFECTADAS"] for a in _parse_lista_campo(v)})
+    ips_mes = sorted({ip for v in pm_f["IPS_INVOLUCRADAS"] for ip in _parse_lista_campo(v)})
     kpis = [
-        ("Reportes", f"{len(pm_f)}", f"de {len(pm_all)} en el periodo", BRAND,
-         "Reportes forenses que cumplen los filtros."),
-        ("Severidad máxima", f"{sev_max:.2f}", f"{n_crit} crítico(s), 0.70 o más",
-         CRITICO if sev_max >= 0.70 else "#E76500",
-         "Puntuación de anomalía del modelo (de 0 a 1) del reporte más grave."),
+        ("Incidentes del mes", f"{len(pm_f)}", f"de {len(pm_all)} en el periodo", BRAND,
+         "Reportes forenses incluidos en el consolidado mensual."),
         ("Tácticas MITRE", f"{n_tacticas}", "tácticas distintas", "#7858FF",
-         "Tácticas MITRE ATT&CK / ATLAS asignadas a los incidentes."),
-        ("Aplicaciones SAP", f"{len(apps)}", "afectadas en total", "#049F9A",
+         "Tácticas MITRE ATT&CK / ATLAS asignadas en el periodo."),
+        ("Aplicaciones SAP", f"{len(apps)}", f"{len(ips_mes)} IP(s) involucradas", "#049F9A",
          ", ".join(apps) or "Sin aplicaciones registradas."),
     ]
-    st.html('<div class="kpis kpis-4">' + "".join(
+    st.html('<div class="kpis kpis-3">' + "".join(
         f'<div class="kpi" style="--c:{c}" title="{html.escape(ayuda)}"><div class="lab"><i></i>{lab}</div>'
         f'<div class="val">{val}</div><div class="det">{det}</div></div>'
         for lab, val, det, c, ayuda in kpis) + '</div>')
 
-    # Cola de incidentes (la fila seleccionada define el expediente) y severidad por expediente
-    c1, c2 = st.columns([2, 1], gap="medium")
-    with c1, tarjeta("Cola de incidentes investigados",
-                     "Ordenados de mayor a menor severidad. Haz clic en una fila para "
-                     "abrir su expediente."):
-        sel = st.dataframe(
-            pm_f[["POSTMORTEM_ID", "TIPO_ATAQUE", "MITRE_TACTIC"]],
-            hide_index=True, on_select="rerun", selection_mode="single-row", key="pm_tabla",
-            column_config={
-                "POSTMORTEM_ID": "Expediente",
-                "TIPO_ATAQUE": "Tipo de ataque",
-                "MITRE_TACTIC": "Táctica MITRE",
-            })
-    filas = sel.selection.rows
-    i_sel = filas[0] if filas and filas[0] < len(pm_f) else 0
-    fila = pm_f.iloc[i_sel]
-
-    with c2, tarjeta("Severidad por expediente",
-                     "Puntuación de anomalía de cada expediente, de 0 a 1. Resaltado, el que está abierto."):
-        orden = pm_f.iloc[::-1]
-        abierto = orden["POSTMORTEM_ID"] == fila["POSTMORTEM_ID"]
-        fig = go.Figure(go.Bar(
-            x=orden["SEVERIDAD_SCORE"], y=orden["POSTMORTEM_ID"], orientation="h",
-            marker=dict(color=[COLOR_TIPO.get(t, BRAND) for t in orden["TIPO_ATAQUE"]],
-                        opacity=[1 if a else .35 for a in abierto], cornerradius=4),
-            text=[f"{v:.2f}" for v in orden["SEVERIDAD_SCORE"]], textposition="outside",
-            textfont=dict(color=INK2, size=11), cliponaxis=False,
-            customdata=orden["TIPO_ATAQUE"],
-            hovertemplate="<b>%{y}</b><br>%{customdata}<br>Severidad %{x:.2f}<extra></extra>"))
-        fig.update_xaxes(range=[0, 1.08], title_text=None)
-        fig.update_yaxes(title_text=None)
-        mostrar(estilo(fig, height=max(200, 44 * len(pm_f) + 50), legend=False,
-                       margin=dict(l=8, r=12, t=8, b=28)))
-
-    pm_id = str(fila.get("POSTMORTEM_ID") or "PM-N/A")
-    sev = float(fila.get("SEVERIDAD_SCORE") or 0.0)
-    sev_txt, sev_cls, _ = _etiqueta_severidad(sev)
-    origen = STREAMS.get(str(fila.get("STREAM")).lower(), str(fila.get("STREAM")))
-    meta = _parse_json_safe(fila.get("METADATA_JSON"))
-    inc = meta.get("incident_meta") or {}
-    apps_l = _parse_lista_campo(fila.get("APLICACIONES_AFECTADAS"))
-    ips_l = _parse_lista_campo(fila.get("IPS_INVOLUCRADAS"))
-    fecha, horas = _rango(fila.get("INICIO"), fila.get("FIN"))
-    md = str(fila.get("REPORTE_MARKDOWN") or "Sin reporte registrado.")
+    # Panorama consolidado del mes y resumen por campana
     esc = html.escape
+    orden_esc = {"5min": 1, "15min": 2, "30min": 3, "1h": 4, "3h": 5}
+    tacticas_mes = sorted(pm_f["MITRE_TACTIC"].dropna().astype(str).unique())
+    tipos_mes = sorted(pm_f["TIPO_ATAQUE"].dropna().astype(str).unique())
+    ini_global, fin_global = _rango(pm_f["INICIO"].min(), pm_f["FIN"].max())
 
-    # Expediente del incidente seleccionado
-    with tarjeta("Expediente Forense del Incidente",
-                 "Análisis que generó el agente forense con los registros de SAP HANA."):
-        h1, h2 = st.columns([3, 1], vertical_alignment="center", gap="medium")
-        with h1:
-            st.html(
-                f'<div class="pm-head"><span class="id">{esc(pm_id)}</span>'
-                f'<span class="pm-pill {sev_cls}">Severidad {sev_txt.lower()} · {sev:.2f}</span>'
-                f'<span class="pm-pill brand">{esc(origen)}</span>'
-                f'<span class="pm-pill">Evento {int(fila.get("EVENTO_ID") or 0)}</span></div>'
-                f'<p class="pm-sub"><b>{esc(str(fila.get("TIPO_ATAQUE") or "N/A"))}</b> · '
-                f'{esc(str(fila.get("MITRE_TACTIC") or "Táctica pendiente"))} · '
-                f'{esc(str(fila.get("SOURCE_TABLE") or "N/A"))} · '
-                f'generado el {esc(_fmt_ts(fila.get("FECHA_GENERACION"))[:16])}</p>')
-        with h2, st.container(key="pm_descargas", gap="small"):
-            try:
-                st.download_button("Descargar PDF", data=_construir_pdf_bytes(fila),
-                                   file_name=f"{pm_id}.pdf", mime="application/pdf",
-                                   icon=":material/download:", width="stretch",
-                                   help="Descarga el reporte ejecutivo de este expediente en PDF.")
-            except Exception as err:
-                st.warning(f"No se pudo generar el PDF: {err}")
-            st.download_button("Descargar Markdown", data=md.encode("utf-8"),
-                               file_name=f"{pm_id}.md", mime="text/markdown",
-                               icon=":material/download:", width="stretch",
-                               help="Descarga el reporte completo de este expediente en Markdown.")
+    grupos_camp = sorted(pm_f.groupby("TIPO_ATAQUE"), key=lambda kv: (-len(kv[1]), str(kv[0])))
+    resumen_camp_rows = []
+    for vec, g in grupos_camp:
+        st_vec = ", ".join(sorted({STREAMS.get(str(s).lower(), str(s)) for s in g["STREAM"].dropna()}))
+        mitre_v = str(g["MITRE_TACTIC"].iloc[0] or "N/A")
+        escs_v = set()
+        best_f, best_z = "N/A", 0.0
+        apps_v = set()
+        for _, r in g.iterrows():
+            m = _parse_json_safe(r.get("METADATA_JSON"))
+            for e in _escalas_de_meta(m):
+                escs_v.add(e)
+            inc = m.get("incident_meta") or {}
+            z = float(inc.get("z_max") or 0.0)
+            if z >= best_z:
+                best_z, best_f = z, str(inc.get("z_max_feature") or "N/A")
+            for a in _parse_lista_campo(r.get("APLICACIONES_AFECTADAS")):
+                apps_v.add(a)
+        resumen_camp_rows.append({
+            "Campaña / Vector": str(vec),
+            "Origen": st_vec,
+            "Táctica MITRE": mitre_v,
+            "Incidentes": len(g),
+            "Ventanas detectadas": ", ".join(sorted(escs_v, key=lambda s: orden_esc.get(s, 99))),
+            "Indicador dominante": f"{nombre(best_f)} (Z = {best_z:.1f})",
+            "Apps SAP": len(apps_v),
+        })
 
-        z_feat = str(inc.get("z_max_feature") or "N/A")
+    with tarjeta("Síntesis ejecutiva del periodo",
+                 "Panorama unificado por campaña de amenaza, aplicaciones e IPs comprometidas en el mes."):
         st.html(
-            '<div class="pm-meta">'
-            f'<div><p class="lbl">Cuándo</p><div class="val">{esc(fecha)}</div>'
-            f'<div class="det">{esc(horas)}</div></div>'
-            f'<div><p class="lbl">Indicador más afectado</p><div class="val">{esc(nombre(z_feat))}</div>'
-            f'<div class="det">Intensidad {float(inc.get("z_max") or 0):.1f}</div></div>'
-            f'<div><p class="lbl">Bloques atípicos</p><div class="val">{int(inc.get("n_ventanas") or 1)}</div>'
-            f'<div class="det">Confianza {esc(str(inc.get("confianza") or "N/A"))}</div></div>'
-            f'<div><p class="lbl">Alcance</p><div class="val">{len(apps_l)} aplicación(es)</div>'
-            f'<div class="det">{len(ips_l)} IP(s) involucradas</div></div>'
-            '</div>')
-        st.html(f'<div class="pm-callout"><b>Resumen ejecutivo</b>'
-                f'{esc(str(fila.get("RESUMEN_EJECUTIVO") or "Sin resumen registrado."))}</div>')
+            f'<div class="pm-callout"><b>Dictamen mensual — {esc(periodo)}</b>'
+            f'Se investigaron <strong>{len(pm_f)}</strong> incidente(s) únicos multi-escala '
+            f'en la ventana <strong>{esc(ini_global)} {esc(fin_global)}</strong>, agrupados en '
+            f'<strong>{len(grupos_camp)}</strong> familia(s) de amenaza '
+            f'({esc(", ".join(f"{v} ({len(g)})" for v, g in grupos_camp))}) '
+            f'sobre <strong>{len(apps)}</strong> aplicación(es) SAP y '
+            f'<strong>{len(ips_mes)}</strong> dirección(es) IP.</div>'
+        )
+        st.dataframe(pd.DataFrame(resumen_camp_rows), hide_index=True)
+        st.html(
+            '<div class="pm-meta dos" style="margin-top:.65rem">'
+            f'<div><p class="lbl">Aplicaciones SAP afectadas ({len(apps)})</p>'
+            f'{_chips(apps, "Sin aplicaciones registradas.")}</div>'
+            f'<div><p class="lbl">Direcciones IP involucradas ({len(ips_mes)})</p>'
+            f'{_chips(ips_mes[:18], "Sin IPs externas asociadas.")}</div>'
+            '</div>'
+        )
+        st.html(
+            '<div style="margin-top:.55rem">'
+            f'<p class="lbl" style="font-size:.72rem;font-weight:700;letter-spacing:.05em;'
+            f'text-transform:uppercase;color:{MUTED};margin:0 0 .3rem;">Tácticas MITRE del mes</p>'
+            f'{_chips(tacticas_mes, "Sin tácticas mapeadas.")}</div>'
+        )
 
-        t1, t2 = st.tabs(["Reporte completo", "Evidencia"])
-        with t1, st.container(key="pm_reporte"):
-            st.markdown(_sin_titulo(md))
-        with t2:
-            st.html(
-                '<div class="pm-meta dos">'
-                f'<div><p class="lbl">Aplicaciones SAP afectadas</p>'
-                f'{_chips(apps_l, "Sin aplicaciones registradas.")}</div>'
-                f'<div><p class="lbl">Direcciones IP involucradas</p>'
-                f'{_chips(ips_l, "Sin IPs externas asociadas.")}</div>'
-                '</div>')
-            logs = (meta.get("evidence_logs_sample")
-                    or (meta.get("raw_evidence") or {}).get("logs_muestra") or [])
-            st.html('<p class="card-title">Muestra de registros</p>'
-                    '<p class="card-sub">Registros originales que el agente consultó en SAP HANA.</p>')
-            if logs and isinstance(logs, list):
-                st.dataframe(pd.DataFrame(logs), hide_index=True)
-            else:
-                vacio("Este reporte no incluye una muestra de registros.")
-            with st.expander("Ver metadatos completos (JSON)"):
-                st.json(meta or {"nota": "Sin metadatos."})
+    # Desglose unificado por campana y cronologia completa
+    with tarjeta(f"Dossier forense del periodo ({len(pm_f)} incidentes en {len(grupos_camp)} campañas)",
+                 "Consulta el análisis agrupado por familia de amenaza o la cronología completa del mes."):
+        tab_camp, tab_cron = st.tabs([
+            "Por campaña / familia de amenaza",
+            "Cronología completa de incidentes",
+        ])
+
+        with tab_camp:
+            for idx_c, (vec, g) in enumerate(grupos_camp):
+                st_vec = ", ".join(sorted({STREAMS.get(str(s).lower(), str(s)) for s in g["STREAM"].dropna()}))
+                mitre_v = str(g["MITRE_TACTIC"].iloc[0] or "N/A")
+                apps_c = sorted({a for v in g["APLICACIONES_AFECTADAS"] for a in _parse_lista_campo(v)})
+                ips_c = sorted({ip for v in g["IPS_INVOLUCRADAS"] for ip in _parse_lista_campo(v)})
+                escs_c = sorted(
+                    {e for _, r in g.iterrows() for e in _escalas_de_meta(_parse_json_safe(r.get("METADATA_JSON")))},
+                    key=lambda s: orden_esc.get(s, 99),
+                )
+                st.html(
+                    f'<div class="pm-head"><span class="id">{esc(str(vec))}</span>'
+                    f'<span class="pm-pill brand">{len(g)} incidente(s)</span>'
+                    f'<span class="pm-pill">{esc(st_vec)}</span>'
+                    f'<span class="pm-pill">Ventanas: {esc(", ".join(escs_c))}</span></div>'
+                    f'<p class="pm-sub"><b>{esc(mitre_v)}</b> · '
+                    f'{len(apps_c)} app(s) SAP · {len(ips_c)} IP(s) involucradas</p>'
+                )
+                for _, fila in g.iterrows():
+                    pm_id = str(fila.get("POSTMORTEM_ID") or "PM-N/A")
+                    meta = _parse_json_safe(fila.get("METADATA_JSON"))
+                    inc = meta.get("incident_meta") or {}
+                    esc_i = ", ".join(_escalas_de_meta(meta))
+                    fecha, horas = _rango(fila.get("INICIO"), fila.get("FIN"))
+                    z_feat = str(inc.get("z_max_feature") or "N/A")
+                    st.html(
+                        f'<div class="pm-callout"><b>{esc(pm_id)} · {esc(fecha)} {esc(horas)} · '
+                        f'Ventanas: {esc(esc_i)} · {esc(nombre(z_feat))} (Z = {float(inc.get("z_max") or 0):.1f})</b>'
+                        f'{esc(str(fila.get("RESUMEN_EJECUTIVO") or "Sin resumen registrado."))}</div>'
+                    )
+                with st.expander(f"Ver reportes individuales y evidencia MCP de {vec} ({len(g)})"):
+                    for _, fila in g.iterrows():
+                        pm_id = str(fila.get("POSTMORTEM_ID") or "PM-N/A")
+                        meta = _parse_json_safe(fila.get("METADATA_JSON"))
+                        md = str(fila.get("REPORTE_MARKDOWN") or "Sin reporte registrado.")
+                        logs = (meta.get("evidence_logs_sample")
+                                or (meta.get("raw_evidence") or {}).get("logs_muestra") or [])
+                        st.markdown(f"#### {pm_id}")
+                        st.markdown(_sin_titulo(md))
+                        if logs and isinstance(logs, list):
+                            st.caption(f"Muestra de registros MCP ({pm_id})")
+                            st.dataframe(pd.DataFrame(logs), hide_index=True)
+                        st.divider()
+                if idx_c < len(grupos_camp) - 1:
+                    st.divider()
+
+        with tab_cron:
+            for idx, fila in pm_f.iterrows():
+                pm_id = str(fila.get("POSTMORTEM_ID") or "PM-N/A")
+                origen = STREAMS.get(str(fila.get("STREAM")).lower(), str(fila.get("STREAM")))
+                meta = _parse_json_safe(fila.get("METADATA_JSON"))
+                inc = meta.get("incident_meta") or {}
+                escalas_l = _escalas_de_meta(meta)
+                apps_l = _parse_lista_campo(fila.get("APLICACIONES_AFECTADAS"))
+                ips_l = _parse_lista_campo(fila.get("IPS_INVOLUCRADAS"))
+                fecha, horas = _rango(fila.get("INICIO"), fila.get("FIN"))
+                z_feat = str(inc.get("z_max_feature") or "N/A")
+                md = str(fila.get("REPORTE_MARKDOWN") or "Sin reporte registrado.")
+
+                st.html(
+                    f'<div class="pm-head"><span class="id">{esc(pm_id)}</span>'
+                    f'<span class="pm-pill brand">{esc(origen)}</span>'
+                    f'<span class="pm-pill">Evento {int(fila.get("EVENTO_ID") or 0)}</span>'
+                    f'<span class="pm-pill">Ventanas: {esc(", ".join(escalas_l))}</span></div>'
+                    f'<p class="pm-sub"><b>{esc(str(fila.get("TIPO_ATAQUE") or "N/A"))}</b> · '
+                    f'{esc(str(fila.get("MITRE_TACTIC") or "Táctica pendiente"))} · '
+                    f'{esc(fecha)} {esc(horas)} · '
+                    f'Indicador: {esc(nombre(z_feat))} (Z = {float(inc.get("z_max") or 0):.1f}) · '
+                    f'{len(apps_l)} app(s) · {len(ips_l)} IP(s)</p>'
+                )
+                st.html(
+                    f'<div class="pm-callout"><b>Resumen ejecutivo</b>'
+                    f'{esc(str(fila.get("RESUMEN_EJECUTIVO") or "Sin resumen registrado."))}</div>'
+                )
+
+                with st.expander(f"Ver reporte completo y evidencia ({pm_id})"):
+                    t1, t2 = st.tabs(["Reporte completo", "Evidencia"])
+                    with t1:
+                        st.markdown(_sin_titulo(md))
+                    with t2:
+                        st.html(
+                            '<div class="pm-meta dos">'
+                            f'<div><p class="lbl">Aplicaciones SAP afectadas</p>'
+                            f'{_chips(apps_l, "Sin aplicaciones registradas.")}</div>'
+                            f'<div><p class="lbl">Direcciones IP involucradas</p>'
+                            f'{_chips(ips_l, "Sin IPs externas asociadas.")}</div>'
+                            '</div>'
+                        )
+                        logs = (meta.get("evidence_logs_sample")
+                                or (meta.get("raw_evidence") or {}).get("logs_muestra") or [])
+                        if logs and isinstance(logs, list):
+                            st.dataframe(pd.DataFrame(logs), hide_index=True)
+                        else:
+                            vacio("Este reporte no incluye una muestra de registros.")
+                        st.json(meta or {"nota": "Sin metadatos."})
+
+                if idx < len(pm_f) - 1:
+                    st.divider()
 
 
 # Navegación

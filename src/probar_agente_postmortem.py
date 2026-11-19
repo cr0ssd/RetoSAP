@@ -11,7 +11,9 @@ Prueba el flujo completo contra SAP HANA Cloud:
 
 import sys
 import os
+import time
 import json
+import argparse
 import logging
 
 # Asegurar resolucion de modulos tanto desde src/ como desde la raiz
@@ -23,17 +25,19 @@ for p in (REPO_ROOT, SRC_DIR):
 
 try:
     from mcp_hana_tools import HanaMcpTools
-    from agente_forense_postmortem import AgenteForensePostmortem
+    from agente_forense_postmortem import AgenteForensePostmortem, construir_postmortem_id
+    from generador_pdf_postmortem import generar_pdf_postmortem_mensual
 except ImportError:
     from src.mcp_hana_tools import HanaMcpTools
-    from src.agente_forense_postmortem import AgenteForensePostmortem
+    from src.agente_forense_postmortem import AgenteForensePostmortem, construir_postmortem_id
+    from src.generador_pdf_postmortem import generar_pdf_postmortem_mensual
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(name)s: %(message)s')
 log = logging.getLogger('probar_agente')
 
 
-def main(mes='2026_01'):
-    log.info("[INFO] Iniciando prueba del Agente Forense y Herramientas MCP para el mes: %s", mes)
+def main(mes='2026_01', reset_postmortems=False, top_k=0):
+    log.info("[INFO] Iniciando generacion forense multi-escala (MCP + Gemini) para el mes: %s", mes)
     mcp = HanaMcpTools()
     agente = AgenteForensePostmortem(mcp_tools=mcp)
 
@@ -41,66 +45,61 @@ def main(mes='2026_01'):
     os.makedirs(out_dir, exist_ok=True)
 
     try:
-        # 1. Obtener candidatos de System y LLM
-        candidatos_sys = mcp.get_candidate_incidents(mes=mes, stream='system', top_k=10)
-        candidatos_llm = mcp.get_candidate_incidents(mes=mes, stream='llm', top_k=10)
+        if reset_postmortems:
+            mcp.clear_postmortems_for_month(mes)
 
-        log.info("[INFO] Candidatos System encontrados: %d | Candidatos LLM encontrados: %d",
-                 len(candidatos_sys), len(candidatos_llm))
-
-        # 2. Seleccionar incidentes representativos
-        seleccionados = []
-
-        # Caso 1: Fuerza Bruta / Ataque System
-        fb_sys = [c for c in candidatos_sys if 'fuerza bruta' in c['tipo_ataque'].lower() or 'explotación' in c['tipo_ataque'].lower()]
-        if fb_sys:
-            seleccionados.append(fb_sys[0])
-        elif candidatos_sys:
-            seleccionados.append(candidatos_sys[0])
-
-        # Caso 2: Prompt Injection en LLM
-        pi_llm = [c for c in candidatos_llm if 'prompt injection' in c['tipo_ataque'].lower()]
-        if pi_llm:
-            seleccionados.append(pi_llm[0])
-
-        # Caso 3: Degradacion / Timeouts en LLM
-        deg_llm = [c for c in candidatos_llm if 'degradación' in c['tipo_ataque'].lower() or 'recursos' in c['tipo_ataque'].lower()]
-        if deg_llm:
-            seleccionados.append(deg_llm[0])
-
-        log.info("[INFO] Incidentes seleccionados para generar Postmortems: %d", len(seleccionados))
+        seleccionados = mcp.get_candidate_incidents(
+            mes=mes,
+            stream=None,
+            top_k=top_k if (top_k and top_k > 0) else None,
+        )
+        existentes = set() if reset_postmortems else mcp.get_existing_postmortem_ids(mes)
+        log.info("[INFO] Incidentes unicos deduplicados en %s: %d (ya existentes en HANA: %d)",
+                 mes, len(seleccionados), len(existentes))
 
         reportes_generados = []
         for i, inc in enumerate(seleccionados, start=1):
-            log.info("--- Procesando Incidente %d de %d (Evento %d: %s) ---",
-                     i, len(seleccionados), inc['evento_id'], inc['tipo_ataque'])
-            
-            res = agente.investigar_y_redactar(mes=mes, incident_data=inc, output_dir=out_dir)
+            pm_id = construir_postmortem_id(mes, inc)
+            if pm_id in existentes:
+                log.info("[SKIP] (%d/%d) %s ya existe en RESULT_POSTMORTEMS_%s",
+                         i, len(seleccionados), pm_id, mes)
+                continue
+            log.info("--- Procesando Incidente %d de %d (%s | %s | escalas=%s) ---",
+                     i, len(seleccionados), pm_id, inc['tipo_ataque'],
+                     ",".join(inc.get('escalas_detectadas', [])))
+
+            res = agente.investigar_y_redactar(mes=mes, incident_data=inc, output_dir=None)
             reportes_generados.append(res)
+            time.sleep(0.35)
 
-            # Guardar archivo Markdown en disco
-            file_name = f"{res['postmortem_id']}.md"
-            file_path = os.path.join(out_dir, file_name)
-            with open(file_path, 'w', encoding='utf-8') as f:
-                f.write(res['reporte_markdown'])
-            log.info("[OK] Reporte exportado a: %s", file_path)
+        if reportes_generados:
+            pdf_mes_path = os.path.join(out_dir, f"Postmortem_SOC_{mes}.pdf")
+            generar_pdf_postmortem_mensual(reportes_generados, mes.replace('_', '-'), pdf_mes_path)
+            log.info("[OK] PDF consolidado mensual generado en: %s", pdf_mes_path)
 
-        # 3. Validar en HANA que los registros estan guardados
+        # Validar en HANA que los registros estan guardados
         tabla_postmortems = f"RESULT_POSTMORTEMS_{mes}"
         cursor = mcp.conn.connection.cursor()
-        cursor.execute(f"SELECT POSTMORTEM_ID, TIPO_ATAQUE, SEVERIDAD_SCORE, INICIO, FIN FROM {tabla_postmortems}")
+        cursor.execute(f'SELECT POSTMORTEM_ID, STREAM, TIPO_ATAQUE, INICIO, FIN FROM "{tabla_postmortems}" ORDER BY INICIO ASC')
         filas = cursor.fetchall()
-        
-        print("\n" + "="*80)
-        print(f"[RESUMEN] POSTMORTEMS PERSISTIDOS EN SAP HANA ({tabla_postmortems}):")
-        print("="*80)
+        cursor.close()
+
+        print("\n" + "=" * 80)
+        print(f"[RESUMEN] POSTMORTEMS PERSISTIDOS EN SAP HANA ({tabla_postmortems}): {len(filas)}")
+        print("=" * 80)
         for fila in filas:
-            print(f"  • ID: {fila[0]} | Tipo: {fila[1]} | Severidad: {fila[2]:.4f} | Intervalo: {fila[3]} -> {fila[4]}")
-        print("="*80 + "\n")
+            print(f"  - ID: {fila[0]} | Stream: {fila[1]} | Tipo: {fila[2]} | Intervalo: {fila[3]} -> {fila[4]}")
+        print("=" * 80 + "\n")
 
     finally:
         mcp.close()
 
 
 if __name__ == '__main__':
-    main()
+    parser = argparse.ArgumentParser(description='Generador forense multi-escala de Postmortems en SAP HANA.')
+    parser.add_argument('--mes', nargs='+', default=['2026_01'], help='Mes(es) AAAA_MM a procesar (default: 2026_01)')
+    parser.add_argument('--reset', action='store_true', help='Limpia RESULT_POSTMORTEMS_<mes> antes de regenerar')
+    parser.add_argument('--top-k', type=int, default=0, help='Limite opcional de incidentes por mes (0 = todos)')
+    args = parser.parse_args()
+    for m in args.mes:
+        main(mes=m, reset_postmortems=args.reset, top_k=args.top_k)

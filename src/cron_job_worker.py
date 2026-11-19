@@ -33,10 +33,12 @@ from helpers.imports import pd
 
 try:
     from mcp_hana_tools import HanaMcpTools
-    from agente_forense_postmortem import AgenteForensePostmortem
+    from agente_forense_postmortem import AgenteForensePostmortem, construir_postmortem_id
+    from generador_pdf_postmortem import generar_pdf_postmortem_mensual
 except ImportError:
     from src.mcp_hana_tools import HanaMcpTools
-    from src.agente_forense_postmortem import AgenteForensePostmortem
+    from src.agente_forense_postmortem import AgenteForensePostmortem, construir_postmortem_id
+    from src.generador_pdf_postmortem import generar_pdf_postmortem_mensual
 
 logging.basicConfig(
     level=logging.INFO,
@@ -46,7 +48,7 @@ logging.basicConfig(
 log = logging.getLogger('cron_worker')
 
 
-def ejecutar_ciclo_completo(tabla_fuente: str = 'LOGS_BATCH_1', top_k_postmortems: int = 3) -> bool:
+def ejecutar_ciclo_completo(tabla_fuente: str = 'LOGS_BATCH_1', top_k_postmortems: int = 0) -> bool:
     """
     Ejecuta un ciclo integral: Pipeline de ML en HANA + Capa Agéntica Postmortem con MCP.
     """
@@ -101,36 +103,49 @@ def ejecutar_ciclo_completo(tabla_fuente: str = 'LOGS_BATCH_1', top_k_postmortem
         out_pdf_dir = os.getenv('OUTPUT_PDF_DIR', os.path.join(REPO_ROOT, 'outputs', 'postmortems'))
         os.makedirs(out_pdf_dir, exist_ok=True)
 
-        # Obtener candidatos criticos
-        candidatos_sys = mcp.get_candidate_incidents(mes=mes_procesado, stream='system', top_k=5)
-        candidatos_llm = mcp.get_candidate_incidents(mes=mes_procesado, stream='llm', top_k=5)
+        # Obtener todos los incidentes unicos deduplicados multi-escala (system + llm)
+        seleccionados = mcp.get_candidate_incidents(
+            mes=mes_procesado,
+            stream=None,
+            top_k=top_k_postmortems if (top_k_postmortems and top_k_postmortems > 0) else None,
+        )
+        existentes = mcp.get_existing_postmortem_ids(mes_procesado)
 
-        # Seleccionar representativos (ataque de sistema, prompt injection, degradacion)
-        seleccionados = []
-        if candidatos_sys:
-            seleccionados.append(candidatos_sys[0])
-        pi_llm = [c for c in candidatos_llm if 'prompt injection' in c['tipo_ataque'].lower()]
-        if pi_llm:
-            seleccionados.append(pi_llm[0])
-        elif candidatos_llm:
-            seleccionados.append(candidatos_llm[0])
-
-        log.info("[CRON][AGENTE] Incidentes seleccionados para investigar: %d", len(seleccionados))
+        log.info("[CRON][AGENTE] Incidentes unicos deduplicados en %s: %d (ya existentes: %d)",
+                 mes_procesado, len(seleccionados), len(existentes))
 
         postmortems_generados = 0
+        resultados_mes = []
         for inc in seleccionados:
             try:
-                log.info("[CRON][AGENTE] Investigando Incidente Evento %s (%s)...", inc['evento_id'], inc['tipo_ataque'])
+                pm_id = construir_postmortem_id(mes_procesado, inc)
+                if pm_id in existentes:
+                    log.info("[CRON][SKIP] %s ya existe en RESULT_POSTMORTEMS_%s; se conserva.",
+                             pm_id, mes_procesado)
+                    continue
+                log.info("[CRON][AGENTE] Investigando %s (Evento %s - %s | escalas=%s)...",
+                         pm_id, inc['evento_id'], inc['tipo_ataque'],
+                         ",".join(inc.get('escalas_detectadas', [])))
                 res = agente.investigar_y_redactar(
                     mes=mes_procesado,
                     incident_data=inc,
-                    output_dir=out_pdf_dir
+                    output_dir=None,
                 )
                 if res:
                     postmortems_generados += 1
+                    resultados_mes.append(res)
                     log.info("[CRON][OK] Postmortem generado y persistido: %s", res['postmortem_id'])
+                    time.sleep(0.4)
             except Exception as e_inc:
                 log.error("[CRON][ERROR] Error al investigar incidente %s: %s", inc.get('evento_id'), e_inc)
+
+        if resultados_mes:
+            try:
+                pdf_mes_path = os.path.join(out_pdf_dir, f"Postmortem_SOC_{mes_procesado}.pdf")
+                generar_pdf_postmortem_mensual(resultados_mes, mes_procesado.replace('_', '-'), pdf_mes_path)
+                log.info("[CRON][OK] PDF consolidado mensual actualizado: %s", pdf_mes_path)
+            except Exception as e_pdf_mes:
+                log.warning("[CRON][WARN] No se pudo escribir PDF consolidado en disco: %s", e_pdf_mes)
 
         tiempo_total = time.perf_counter() - inicio_ciclo
         log.info("[CRON] ========================================================")

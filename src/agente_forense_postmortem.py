@@ -39,16 +39,58 @@ except ImportError:
 
 log = logging.getLogger('agente_forense')
 
-# Mapeo de vectores a MITRE ATT&CK
+# Mapeo de vectores a MITRE ATT&CK / ATLAS
 MITRE_MAP = {
+    'Contexto SAP': {'tactic': 'TA0001: Initial Access', 'technique': 'T1078: Valid Accounts / SAP Context Anomaly'},
     'Fuerza bruta': {'tactic': 'TA0006: Credential Access', 'technique': 'T1110: Brute Force / Password Spraying'},
     'Explotación': {'tactic': 'TA0001: Initial Access', 'technique': 'T1190: Exploit Public-Facing Application'},
+    'Reconocimiento': {'tactic': 'TA0043: Reconnaissance', 'technique': 'T1595: Active Scanning / Endpoint Probing'},
     'DDoS': {'tactic': 'TA0040: Impact', 'technique': 'T1498: Network Denial of Service'},
     'DoS': {'tactic': 'TA0040: Impact', 'technique': 'T1499: Endpoint Denial of Service'},
     'Prompt injection': {'tactic': 'TA0001: Initial Access (AI)', 'technique': 'AML.T0051: LLM Prompt Injection & Jailbreak'},
     'Degradación del servicio': {'tactic': 'TA0040: Impact (AI)', 'technique': 'AML.T0029: Denial of ML Service / Token Exhaustion'},
-    'Abuso de recursos': {'tactic': 'TA0009: Resource Development', 'technique': 'AML.T0034: LLM Compute Resource Hijacking'}
+    'Abuso de recursos': {'tactic': 'TA0040: Impact (AI)', 'technique': 'AML.T0034: LLM Compute Resource Hijacking'},
+    'Acceso no autorizado': {'tactic': 'TA0006: Credential Access (AI)', 'technique': 'AML.T0040: AI Model Inference API Unauthorized Access'},
+    'Automatización': {'tactic': 'TA0005: Defense Evasion (AI)', 'technique': 'AML.T0048: Automated Scripting & Bot Abuse'},
 }
+
+
+def construir_postmortem_id(mes: str, incident_data: Dict[str, Any]) -> str:
+    """Genera un identificador unico por mes, evento, escala de ventana y stream."""
+    evento_id = int(incident_data['evento_id'])
+    stream = str(incident_data['stream'])[:3].upper()
+    w_label = str(incident_data.get('window_label') or '').strip().upper().replace('MIN', 'M')
+    if w_label:
+        return f"PM-{mes}-EV{evento_id:03d}-{w_label}-{stream}"
+    return f"PM-{mes}-EV{evento_id:03d}-{stream}"
+
+
+def _extraer_resumen_de_markdown(reporte_md: str, fallback: str) -> str:
+    """Extrae el parrafo narrativo de la Seccion 1 redactada por Gemini si esta disponible."""
+    if not reporte_md or "## 1." not in reporte_md:
+        return fallback[:900]
+    sec1 = reporte_md.split("## 1.", 1)[1]
+    if "## 2." in sec1:
+        sec1 = sec1.split("## 2.", 1)[0]
+    parrafos = []
+    for line in sec1.splitlines():
+        s = line.strip()
+        if not s or s.startswith("#") or s.startswith("-") or s.startswith("*") or s.startswith("|"):
+            continue
+        limpio = s.replace("**", "").replace("`", "")
+        if limpio.lower().startswith("resumen ejecutivo"):
+            limpio = limpio.split(":", 1)[-1].strip() if ":" in limpio else limpio[len("resumen ejecutivo"):].lstrip(" .-")
+        if limpio.lower().startswith("y clasificacion de la amenaza"):
+            limpio = limpio[len("y clasificacion de la amenaza"):].lstrip(" .:-")
+        if len(limpio) >= 45:
+            parrafos.append(limpio)
+    if parrafos:
+        texto = " ".join(parrafos[:2])
+        if len(texto) > 900:
+            corte = texto[:900].rfind(". ")
+            texto = (texto[:corte + 1] if corte > 300 else texto[:897] + "...")
+        return texto
+    return fallback[:900]
 
 
 class AgenteForensePostmortem:
@@ -103,11 +145,18 @@ class AgenteForensePostmortem:
         stream = incident_data['stream']
         tipo_ataque = incident_data['tipo_ataque']
         source_table = incident_data.get('source_table', 'LOGS_BATCH_1')
+        window_size_s = incident_data.get('window_size_s')
+        escalas = incident_data.get('escalas_detectadas') or (
+            [incident_data['window_label']] if incident_data.get('window_label') else ['5min']
+        )
 
-        log.info("[FORENSIC] Investigando Evento %d (%s - %s)...", evento_id, stream, tipo_ataque)
+        log.info("[FORENSIC] Investigando Evento %d (%s - %s | escalas=%s)...",
+                 evento_id, stream, tipo_ataque, ",".join(escalas))
 
-        # Paso 1: Telemetria de ventanas via MCP
-        telemetry = self.mcp.get_incident_windows_telemetry(mes, stream, evento_id)
+        # Paso 1: Telemetria de ventanas via MCP (filtrada por window_size_s)
+        telemetry = self.mcp.get_incident_windows_telemetry(
+            mes, stream, evento_id, window_size_s=window_size_s
+        )
 
         # Paso 2: Logs crudos y evidencia via MCP
         raw_evidence = self.mcp.sample_raw_logs_for_incident(
@@ -121,11 +170,11 @@ class AgenteForensePostmortem:
         # Paso 3: Identificar Mitre
         mitre_info = MITRE_MAP.get(tipo_ataque, {
             'tactic': 'TA0001: Initial Access',
-            'technique': 'T1190: Unknown Vector'
+            'technique': 'T1078: Anomaly Vector'
         })
 
         # Paso 4: Redactar reporte (Gemini API o Motor de Respaldo)
-        postmortem_id = f"PM-{mes}-EV{evento_id:03d}-{stream[:3].upper()}"
+        postmortem_id = construir_postmortem_id(mes, incident_data)
 
         if self.llm_client and self.llm_client[0] == 'gemini':
             reporte_md = self._sintetizar_con_gemini(
@@ -144,12 +193,15 @@ class AgenteForensePostmortem:
                 mitre_info=mitre_info
             )
 
-        resumen_ejecutivo = (
-            f"Incidente {postmortem_id}: Se detecto una campana de '{tipo_ataque}' clasificada como "
-            f"{mitre_info['technique']} con severidad IF de {incident_data['score_pico']:.4f}. "
-            f"Afecto a {len(raw_evidence['aplicaciones_afectadas'])} aplicaciones SAP durante "
-            f"{incident_data['n_ventanas']} ventanas de observabilidad."
+        resumen_base = (
+            f"Incidente {postmortem_id}: Se detecto actividad de '{tipo_ataque}' clasificada bajo "
+            f"{mitre_info['technique']} en las escalas {', '.join(escalas)}. "
+            f"Involucro a {len(raw_evidence['aplicaciones_afectadas'])} aplicacion(es) SAP y "
+            f"{len(raw_evidence['ips_involucradas'])} direccion(es) IP a lo largo de "
+            f"{incident_data['n_ventanas']} ventana(s) anomala(s), con desviacion maxima en "
+            f"{incident_data.get('z_max_feature', 'N/A')} (Z = {float(incident_data.get('z_max') or 0.0):.2f})."
         )
+        resumen_ejecutivo = _extraer_resumen_de_markdown(reporte_md, resumen_base)
 
         resultado = {
             'postmortem_id': postmortem_id,
@@ -158,7 +210,7 @@ class AgenteForensePostmortem:
             'source_table': source_table,
             'tipo_ataque': tipo_ataque,
             'mitre_tactic': mitre_info['tactic'],
-            'severidad_score': incident_data['score_pico'],
+            'severidad_score': float(incident_data.get('score_pico') or 0.0),
             'inicio': incident_data['inicio'],
             'fin': incident_data['fin'],
             'aplicaciones_afectadas': raw_evidence['aplicaciones_afectadas'],
@@ -166,9 +218,14 @@ class AgenteForensePostmortem:
             'resumen_ejecutivo': resumen_ejecutivo,
             'reporte_markdown': reporte_md,
             'metadata_json': {
-                'incident_meta': incident_data,
+                'incident_meta': {
+                    **incident_data,
+                    'escalas_detectadas': escalas,
+                },
                 'telemetry_summary': telemetry.get('metricas_resumen', {}),
                 'mitre_info': mitre_info,
+                'escalas_detectadas': escalas,
+                'evidence_logs_sample': raw_evidence.get('logs_muestra', [])[:6],
                 'total_raw_evidence_sampled': raw_evidence['total_obtenidos'],
                 'generador': 'gemini_api' if (self.llm_client and self.llm_client[0] == 'gemini') else 'deterministico'
             }
@@ -199,7 +256,7 @@ class AgenteForensePostmortem:
         from google.genai import types
 
         client = self.llm_client[1]
-        model_name = os.getenv("GEMINI_MODEL", "gemini-3.5-flash")
+        model_name = os.getenv("GEMINI_MODEL", "gemini-3.5-flash-lite")
 
         system_instruction = (
             "Eres un Especialista Principal de Ciberseguridad e Investigador Forense en el SOC de SAP Cloud Observability.\n"
@@ -217,12 +274,13 @@ class AgenteForensePostmortem:
             "## 3. Sistemas, Servicios y Componentes SAP Comprometidos\n"
             "## 4. Analisis Forense de Causa Raiz y Evidencia (Root Cause)\n"
             "## 5. Plan de Mitigacion y Recomendaciones de Hardening (Action Items)\n\n"
-            "3. En la Seccion 2, genera una tabla Markdown obligatoria con columnas: Hito | Marca Temporal (UTC) | Descripcion Operativa.\n"
-            "4. En la Seccion 4, cita de forma precisa los logs crudos, IPs, paths o payloads de inferencia proporcionados en la evidencia para respaldar pericialmente el analisis.\n"
-            "5. En la Seccion 5, incluye dos subapartados claros:\n"
+            "3. En la Seccion 1, incluye un parrafo narrativo claro explicando que ocurrio, en que escalas de ventana temporal se detecto y cual fue el indicador mas desviado (Z-score). No incluyas metricas de 'severidad' ni 'score de severidad'.\n"
+            "4. En la Seccion 2, genera una tabla Markdown obligatoria con columnas: Hito | Marca Temporal (UTC) | Descripcion Operativa.\n"
+            "5. En la Seccion 4, cita de forma precisa los logs crudos, IPs, paths o payloads de inferencia proporcionados en la evidencia para respaldar pericialmente el analisis.\n"
+            "6. En la Seccion 5, incluye dos subapartados claros:\n"
             "   ### Acciones Inmediatas (Contencion)\n"
             "   ### Acciones a Mediano Plazo (Hardening de Arquitectura)\n"
-            "6. Manten un tono pericial corporativo, conciso y de alto nivel de seguridad."
+            "7. Manten un tono pericial corporativo, conciso y de alto nivel de seguridad."
         )
 
         prompt_payload = {
@@ -232,7 +290,8 @@ class AgenteForensePostmortem:
                 "stream": incident_data.get('stream'),
                 "tipo_ataque": incident_data.get('tipo_ataque'),
                 "confianza": incident_data.get('confianza'),
-                "score_pico_isolation_forest": incident_data.get('score_pico'),
+                "window_label": incident_data.get('window_label'),
+                "escalas_detectadas": incident_data.get('escalas_detectadas', []),
                 "z_max": incident_data.get('z_max'),
                 "z_max_feature": incident_data.get('z_max_feature'),
                 "inicio": str(incident_data.get('inicio')),
@@ -252,26 +311,16 @@ class AgenteForensePostmortem:
             "Genera el reporte postmortem completo en Markdown siguiendo estrictamente las 5 secciones requeridas."
         )
 
-        try:
-            log.info("[LLM] Invocando Gemini API (modelo: %s) para redactar postmortem %s...", model_name, postmortem_id)
-            resp = client.models.generate_content(
-                model=model_name,
-                contents=user_content,
-                config=types.GenerateContentConfig(
-                    system_instruction=system_instruction,
-                    temperature=0.2,
-                )
-            )
-            if resp and resp.text:
-                log.info("[OK] Reporte postmortem redactado exitosamente por Gemini API (%s).", model_name)
-                return resp.text.strip()
-            raise RuntimeError("Respuesta vacia recibida de Gemini API.")
-        except Exception as e:
-            model_fallback = "gemini-3.5-flash-lite" if model_name != "gemini-3.5-flash-lite" else "gemini-3.6-flash"
-            log.warning("[WARN] Fallo con modelo %s (%s). Reintentando con %s...", model_name, e, model_fallback)
+        modelos_intento = [model_name]
+        for candidato_fb in ("gemini-3.5-flash-lite", "gemini-3.5-flash", "gemini-3.1-flash-lite"):
+            if candidato_fb not in modelos_intento:
+                modelos_intento.append(candidato_fb)
+
+        for idx_m, m_actual in enumerate(modelos_intento):
             try:
+                log.info("[LLM] Invocando Gemini API (modelo: %s) para redactar postmortem %s...", m_actual, postmortem_id)
                 resp = client.models.generate_content(
-                    model=model_fallback,
+                    model=m_actual,
                     contents=user_content,
                     config=types.GenerateContentConfig(
                         system_instruction=system_instruction,
@@ -279,15 +328,18 @@ class AgenteForensePostmortem:
                     )
                 )
                 if resp and resp.text:
-                    log.info("[OK] Reporte postmortem redactado exitosamente con %s.", model_fallback)
+                    log.info("[OK] Reporte postmortem redactado exitosamente por Gemini API (%s).", m_actual)
                     return resp.text.strip()
-            except Exception as e2:
-                log.warning("[WARN] Fallback de Gemini tampoco respondio: %s", e2)
+                raise RuntimeError("Respuesta vacia recibida de Gemini API.")
+            except Exception as e:
+                log.warning("[WARN] Fallo con modelo %s (%s).", m_actual, e)
+                if idx_m + 1 < len(modelos_intento):
+                    log.info("[LLM] Reintentando con fallback %s...", modelos_intento[idx_m + 1])
 
-            log.warning("[WARN] Recurriendo a motor deterministico de respaldo para %s.", postmortem_id)
-            return self._sintetizar_postmortem_deterministico(
-                postmortem_id, incident_data, telemetry, raw_evidence, mitre_info
-            )
+        log.warning("[WARN] Recurriendo a motor deterministico de respaldo para %s.", postmortem_id)
+        return self._sintetizar_postmortem_deterministico(
+            postmortem_id, incident_data, telemetry, raw_evidence, mitre_info
+        )
 
     def _sintetizar_postmortem_deterministico(self, postmortem_id: str, incident_data: Dict[str, Any],
                                                telemetry: Dict[str, Any], raw_evidence: Dict[str, Any],
@@ -341,14 +393,14 @@ class AgenteForensePostmortem:
 - **Identificador de Incidente:** `{postmortem_id}` (Evento ID `{incident_data['evento_id']}`)
 - **Stream de Telemetria:** `{stream.upper()}`
 - **Vector de Ataque Clasificado:** `{tipo_ataque}` (Confianza: `{incident_data['confianza'].upper()}`)
-- **Severidad de Deteccion (Isolation Forest):** `{incident_data['score_pico']:.4f}`
+- **Escalas de Ventana Detectadas:** `{', '.join(incident_data.get('escalas_detectadas') or [str(incident_data.get('window_label', '5min'))])}`
 - **Variable de Mayor Anomalia (Z-Score):** `{incident_data['z_max_feature']}` (Z = `{incident_data['z_max']:.2f}`)
 - **Mapeo MITRE ATT&CK:**
   - **Tactica:** `{mitre_info['tactic']}`
   - **Tecnica:** `{mitre_info['technique']}`
 
 ### Resumen del Evento:
-Durante la ventana de monitoreo se detecto una desviacion severa respecto a la linea base operativa. El modelo Isolation Forest aislo {incident_data['n_ventanas']} ventanas anomalas consecutivas que alcanzaron un z-score maximo en la variable `{incident_data['z_max_feature']}`. El perfil de ejecucion coincide con patrones conocidos de **{tipo_ataque}**, afectando servicios criticos del entorno SAP.
+Durante la ventana de monitoreo se detecto una desviacion anomala respecto a la linea base operativa en las escalas `{', '.join(incident_data.get('escalas_detectadas') or [str(incident_data.get('window_label', '5min'))])}`. El modelo Isolation Forest aislo {incident_data['n_ventanas']} ventanas anomalas consecutivas que alcanzaron un z-score maximo de {incident_data['z_max']:.2f} en la variable `{incident_data['z_max_feature']}`. El perfil de ejecucion coincide con patrones de **{tipo_ataque}**, afectando los servicios {apps}.
 
 ---
 
