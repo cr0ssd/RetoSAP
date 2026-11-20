@@ -15,6 +15,7 @@ COPY src/dashboard ./src/dashboard
 COPY src/helpers ./src/helpers
 COPY src/generador_pdf_postmortem.py ./src/generador_pdf_postmortem.py
 COPY src/mcp_hana_tools.py ./src/mcp_hana_tools.py
+COPY src/workflow.py ./src/workflow.py
 
 EXPOSE 8501
 

@@ -3,3 +3,5 @@ data/
 .env
 __pycache__/
 demo_pipeline_enero.ipynb
+.DS_Store
+*.docx

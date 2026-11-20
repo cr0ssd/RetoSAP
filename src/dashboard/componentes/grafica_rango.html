@@ -1,0 +1,67 @@
+<!doctype html>
+<!--
+  Componente de Streamlit: gráfica de Plotly con su barra de rango original.
+  Avisa a Streamlit cuando cambia el periodo visible (zoom, barra inferior o doble clic),
+  para que el dashboard recalcule la página con ese periodo.
+  Protocolo de componentes de Streamlit (apiVersion 1) sin dependencias de compilación.
+-->
+<html>
+<head>
+  <meta charset="utf-8">
+  <script src="plotly.min.js"></script>
+  <style>
+    html, body { margin: 0; padding: 0; background: transparent; overflow: hidden; }
+    #grafica { width: 100%; }
+  </style>
+</head>
+<body>
+  <div id="grafica"></div>
+  <script>
+    const div = document.getElementById("grafica");
+    let listo = false, espera = null, ultimo = null;
+
+    function enviar(tipo, datos) {
+      window.parent.postMessage(Object.assign({ isStreamlitMessage: true, type: tipo }, datos), "*");
+    }
+
+    function avisar(valor) {
+      const txt = JSON.stringify(valor);
+      if (txt === ultimo) return;          // sin cambios: no recalcula
+      ultimo = txt;
+      enviar("streamlit:setComponentValue", { value: valor, dataType: "json" });
+    }
+
+    function alCambiar(ev) {
+      let x0 = null, x1 = null, todo = false;
+      if (ev["xaxis.autorange"] === true) {          // doble clic: periodo completo
+        todo = true;
+      } else if (Array.isArray(ev["xaxis.range"])) {
+        [x0, x1] = ev["xaxis.range"];
+      } else if (ev["xaxis.range[0]"] !== undefined) {
+        x0 = ev["xaxis.range[0]"]; x1 = ev["xaxis.range[1]"];
+      } else {
+        return;                            // otros cambios de la gráfica (leyenda, hover...)
+      }
+      clearTimeout(espera);                // espera a que el usuario suelte la barra
+      espera = setTimeout(() => avisar(todo ? { todo: true } : { x0: x0, x1: x1 }), 350);
+    }
+
+    window.addEventListener("message", (event) => {
+      if (!event.data || event.data.type !== "streamlit:render") return;
+      const args = event.data.args;
+      const fig = JSON.parse(args.fig);
+      const alto = args.alto || 400;
+      fig.layout.height = alto;
+      Plotly.react(div, fig.data, fig.layout, { displayModeBar: false, responsive: true }).then(() => {
+        if (!listo) {
+          div.on("plotly_relayout", alCambiar);
+          listo = true;
+        }
+        enviar("streamlit:setFrameHeight", { height: alto });
+      });
+    });
+
+    enviar("streamlit:componentReady", { apiVersion: 1 });
+  </script>
+</body>
+</html>
