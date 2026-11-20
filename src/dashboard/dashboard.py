@@ -1,7 +1,9 @@
 import html
 import io
 import json
+import os
 import re
+import time
 import sys
 from contextlib import contextmanager
 from pathlib import Path
@@ -23,7 +25,37 @@ import hana_ml.dataframe as hana_df
 from generador_pdf_postmortem import generar_pdf_postmortem, generar_pdf_postmortem_mensual
 from helpers.conexion import _params
 from helpers.explicacion import FAMILIAS_SYSTEM, FAMILIAS_LLM, zscores, perfil_familias
-from helpers.clasificacion import FIRMAS, TIPOS_NO_ATAQUE
+from helpers.clasificacion import FIRMAS, TIPOS_NO_ATAQUE, clasificar_eventos, validar_firmas
+from helpers import ventanas as ventanas_mod
+from helpers.semanas import calculate_week_range, tabla_semanas, split_into_weeks
+from helpers.eventos import agrupar_eventos, resumen_eventos
+from helpers.relevantes import marcar_relevantes
+from helpers.IsolationForest import (N_ESTIMATORS as IF_N_ESTIMATORS, MAX_SAMPLES as IF_MAX_SAMPLES,
+                                     CONTAMINATION as CONTAMINATION_IF, RANDOM_STATE as IF_RANDOM_STATE)
+from hana_ml.algorithms.pal.preprocessing import IsolationForest as PalIsolationForest
+import workflow as wf   # configuración y pasos del pipeline de producción
+
+def _declarar_grafica_rango():
+    """
+    Componente con la gráfica de Plotly y su barra de rango original, que avisa a Streamlit cuando
+    cambia el periodo visible. Usa el plotly.js incluido en el paquete de Python (misma versión que
+    genera las figuras y sin depender de internet).
+    """
+    import shutil
+    import tempfile
+    import plotly
+    import streamlit.components.v1 as components
+
+    js = Path(plotly.__file__).parent / "package_data" / "plotly.min.js"
+    destino = Path(tempfile.gettempdir()) / f"sap_grafica_rango_{plotly.__version__}"
+    destino.mkdir(exist_ok=True)
+    shutil.copyfile(DASHBOARD_DIR / "componentes" / "grafica_rango.html", destino / "index.html")
+    if not (destino / "plotly.min.js").exists():
+        shutil.copyfile(js, destino / "plotly.min.js")
+    return components.declare_component("grafica_rango", path=str(destino))
+
+
+grafica_rango = _declarar_grafica_rango()
 
 st.set_page_config(page_title="Anomalías SAP", page_icon=":material/shield:", layout="wide")
 
@@ -168,6 +200,11 @@ st.html(f"""
   [data-testid="stSidebar"] {{ border-right: 1px solid {CARD_BORDER}; }}
   .side-brand {{ font-size: 1.15rem; font-weight: 700; color: {INK}; }}
   .side-brand span {{ color: {BRAND}; }}
+  .side-periodo {{ background: #e5f3ff; border: 1px solid #b5dcff; border-radius: 10px;
+      padding: .55rem .7rem; font-size: .84rem; color: {INK}; margin-bottom: .5rem; }}
+  .side-periodo b {{ display: block; font-size: .7rem; letter-spacing: .06em; text-transform: uppercase;
+      color: #0057d2; margin-bottom: .15rem; }}
+  .side-periodo span {{ display: block; font-size: .74rem; color: {MUTED}; margin-top: .2rem; }}
   .side-sub {{ font-size: 0.8rem; color: {MUTED}; margin-bottom: .4rem; }}
 
   /* Nada se oculta al quitar el mouse: botón para contraer la barra y marcas del deslizador */
@@ -204,6 +241,42 @@ st.html(f"""
   .tipo .sen li {{ font-size: .83rem; color: {INK2}; padding: .12rem 0; }}
   .tipo .sen li span {{ display: inline-block; width: 1.3rem; color: var(--c); font-weight: 700; }}
 
+  /* MLOps: health checks */
+  .hc-grid {{ display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: .9rem; }}
+  @media (max-width: 1000px) {{ .hc-grid {{ grid-template-columns: minmax(0, 1fr); }} }}
+  .hc-group {{ background: {PAGE}; border: 1px solid {CARD_BORDER}; border-radius: 12px; padding: .75rem .9rem; }}
+  .hc-gtitle {{ font-size: .72rem; font-weight: 700; letter-spacing: .06em; text-transform: uppercase;
+      color: {MUTED}; margin: 0 0 .35rem; }}
+  .hc-row {{ display: grid; grid-template-columns: 12px minmax(0, 1fr) auto; gap: .7rem; align-items: center;
+      padding: .55rem 0; border-top: 1px solid {CARD_BORDER}; }}
+  .hc-row:first-of-type {{ border-top: none; }}
+  .hc-dot {{ width: 10px; height: 10px; border-radius: 50%; }}
+  .hc-dot.ok {{ background: #188918; }} .hc-dot.warn {{ background: #E76500; }}
+  .hc-dot.fail {{ background: {CRITICO}; }} .hc-dot.info {{ background: {BRAND}; }}
+  .hc-main b {{ display: block; font-size: .88rem; color: {INK}; font-weight: 650; }}
+  .hc-main span {{ display: block; font-size: .78rem; color: {MUTED}; line-height: 1.4; margin-top: .1rem; }}
+  .hc-val {{ display: flex; flex-direction: column; align-items: flex-end; gap: .25rem; text-align: right; }}
+  .hc-val b {{ font-size: .84rem; color: {INK}; font-weight: 650; white-space: pre; line-height: 1.35; }}
+  .hc-pill {{ font-size: .7rem; font-weight: 700; padding: .12rem .55rem; border-radius: 999px; white-space: nowrap; }}
+  .hc-pill.ok {{ background: #e8f6e8; color: #106b10; }} .hc-pill.warn {{ background: #fff1e3; color: #a93e00; }}
+  .hc-pill.fail {{ background: #fdeaea; color: {CRITICO}; }} .hc-pill.info {{ background: #e5f3ff; color: #0057d2; }}
+  /* MLOps: pasos del entrenamiento */
+  .tr-steps {{ display: flex; flex-direction: column; gap: .45rem; margin-top: .4rem; }}
+  .tr-step {{ display: grid; grid-template-columns: 28px minmax(0, 1fr) auto; gap: .7rem; align-items: center;
+      padding: .5rem .7rem; border: 1px solid {CARD_BORDER}; border-radius: 10px; background: {SURFACE}; }}
+  .tr-step b {{ display: block; font-size: .86rem; color: {INK}; font-weight: 650; }}
+  .tr-step > div > span {{ display: block; font-size: .76rem; color: {MUTED}; }}
+  .tr-step em {{ font-style: normal; font-size: .78rem; color: {MUTED}; font-variant-numeric: tabular-nums; }}
+  .tr-num {{ width: 26px; height: 26px; border-radius: 50%; display: flex; align-items: center;
+      justify-content: center; line-height: 1; font-size: .78rem; font-variant-numeric: tabular-nums;
+      font-weight: 700; background: {GRID}; color: {MUTED}; }}
+  .tr-step.corriendo {{ border-color: {BRAND}; background: #f0f7ff; }}
+  .tr-step.corriendo .tr-num {{ background: {BRAND}; color: #fff; animation: trpulse 1.2s ease-in-out infinite; }}
+  .tr-step.corriendo em {{ color: {BRAND}; font-weight: 600; }}
+  .tr-step.ok .tr-num {{ background: #188918; color: #fff; }}
+  .tr-step.error {{ border-color: {CRITICO}; background: #fdeaea; }}
+  .tr-step.error .tr-num {{ background: {CRITICO}; color: #fff; }}
+  @keyframes trpulse {{ 0%, 100% {{ opacity: 1; }} 50% {{ opacity: .45; }} }}
   /* Postmortems SOC */
   .pm-head {{ display: flex; flex-wrap: wrap; align-items: center; gap: .5rem; }}
   .pm-head .id {{ font-size: 1.15rem; font-weight: 700; color: {INK}; margin-right: .2rem; }}
@@ -231,6 +304,7 @@ st.html(f"""
   .pm-chip {{ font-size: .78rem; font-weight: 600; padding: .22rem .65rem; border-radius: 8px;
       background: {SURFACE}; border: 1px solid {CARD_BORDER}; color: {INK2};
       font-variant-numeric: tabular-nums; }}
+  .pm-chip.rango {{ background: #e5f3ff; border-color: #b5dcff; color: #0057d2; }}
   .pm-vacio {{ font-size: .84rem; color: {MUTED}; }}
   /* Botones de descarga: neutros, y se pintan de azul el que se señala o se presiona */
   .st-key-pm_descargas button {{ background: {SURFACE}; color: {INK2}; border: 1px solid {CARD_BORDER};
@@ -262,9 +336,11 @@ def tarjeta(titulo=None, sub=None):
         yield
 
 
-def encabezado(eyebrow, titulo, sub, pills=None):
-    pills = pills or [("Periodo", MES.replace("_", "-")), ("Origen", STREAMS[STREAM]),
-                      ("Bloques de", ETIQUETA[SIZE_S])]
+def encabezado(eyebrow, titulo, sub, pills=None, con_periodo=True):
+    pills = list(pills or [("Periodo", MES.replace("_", "-")), ("Origen", STREAMS[STREAM]),
+                           ("Bloques de", ETIQUETA[SIZE_S])])
+    if con_periodo and TXT_PERIODO:
+        pills.append(("Seleccionado", TXT_PERIODO))
     st.html(f'<div class="banner"><div class="eyebrow">{eyebrow}</div>'
             f'<p class="titulo">{titulo}</p>'
             + (f'<p class="sub">{sub}</p>' if sub and sub.strip() else "")
@@ -580,6 +656,7 @@ with st.sidebar:
     ETIQUETA = dict(zip(tam["WINDOW_SIZE_S"], tam["WINDOW_LABEL"]))
     SIZE_S = st.select_slider("Intervalo de análisis", list(ETIQUETA), value=list(ETIQUETA)[0],
                               format_func=ETIQUETA.get, key="size")
+    aviso_periodo = st.container()   # se llena después de calcular el periodo seleccionado
     st.divider()
     pm_all = leer_postmortems(MES)
     pm_stream_n = int((pm_all["STREAM"].astype(str).str.lower() == STREAM).sum()) if not pm_all.empty else 0
@@ -602,8 +679,59 @@ RES = RES_S[RES_S["WINDOW_SIZE_S"] == SIZE_S]
 Z_UMBRAL = float(RES["Z_UMBRAL"].iloc[0]) if len(RES) else 5.0
 VALID = valid_all[(valid_all["SOURCE_TABLE"] == FUENTE) & (valid_all["STREAM"] == STREAM)]
 
+# ---------------------------------------------------------------------------
+# Periodo seleccionado (filtro global)
+# Se elige en la gráfica de actividad del Resumen (zoom o barra inferior) y se aplica a todas las
+# páginas. Se conserva al cambiar de origen o de intervalo y se borra al cambiar de mes.
+# ---------------------------------------------------------------------------
+def limpiar_periodo():
+    st.session_state.pop("periodo_sel", None)
+    st.session_state["tl_ver"] = st.session_state.get("tl_ver", 0) + 1   # gráfica nueva, sin zoom
+
+
+CLAVE_TL = f"tl_{MES}_{STREAM}_{SIZE_S}_{st.session_state.get('tl_ver', 0)}"
+_val = st.session_state.get(CLAVE_TL)
+if _val is not None and st.session_state.get("tl_procesado") != (CLAVE_TL, _val):
+    st.session_state["tl_procesado"] = (CLAVE_TL, _val)       # cada evento de la gráfica, una vez
+    if _val.get("todo"):
+        st.session_state.pop("periodo_sel", None)
+    elif _val.get("x0") and _val.get("x1"):
+        st.session_state["periodo_sel"] = (MES, pd.to_datetime(_val["x0"]), pd.to_datetime(_val["x1"]))
+
+# Datos completos del mes (la gráfica de actividad siempre muestra todo el mes)
+WIN_MES, EV_MES, REL_MES, PM_MES = WIN, EV, REL, pm_all
+T_MIN, T_MAX = WIN_MES["WINDOW_START"].min(), WIN_MES["WINDOW_START"].max()
+PERIODO = None
+_sel = st.session_state.get("periodo_sel")
+if _sel and _sel[0] == MES and (_sel[1] > T_MIN or _sel[2] < T_MAX):
+    PERIODO = (max(_sel[1], T_MIN), min(_sel[2], T_MAX))
+
+
+def en_periodo(df, ini="INICIO", fin="FIN_REAL"):
+    """Filas cuyo intervalo [ini, fin] se cruza con el periodo seleccionado."""
+    if PERIODO is None or df.empty:
+        return df
+    return df[(df[ini] <= PERIODO[1]) & (df[fin] >= PERIODO[0])]
+
+
+if PERIODO:
+    WIN = WIN_MES[WIN_MES["WINDOW_START"].between(*PERIODO)]
+    EV, REL = en_periodo(EV_MES), en_periodo(REL_MES)
+    pm_all = en_periodo(PM_MES, "INICIO", "FIN")
+    VALID = VALID.assign(_FIN=VALID["WEEK_START"] + pd.Timedelta(days=7))
+    VALID = en_periodo(VALID, "WEEK_START", "_FIN").drop(columns="_FIN")
+    TXT_PERIODO = f"{PERIODO[0]:%d/%m %H:%M} – {PERIODO[1]:%d/%m %H:%M}"
+    with aviso_periodo:
+        st.html(f'<div class="side-periodo"><b>Periodo seleccionado</b>{TXT_PERIODO}'
+                '<span>Todas las páginas muestran solo este periodo.</span></div>')
+        st.button("Ver todo el mes", icon=":material/zoom_out_map:", width="stretch",
+                  key="periodo_limpiar_lateral", on_click=limpiar_periodo)
+else:
+    TXT_PERIODO = None
+
 # Gráficas
-def fig_linea_tiempo(height=400):
+def fig_linea_tiempo(height=400, rango=None):
+    WIN, REL = WIN_MES, REL_MES   # la gráfica muestra todo el mes; el zoom marca el periodo
     col = VOLUMEN[STREAM]
     fig = go.Figure()
     # ancho mínimo de 30 min para que el evento se vea (igual que graficar_eventos del notebook)
@@ -638,11 +766,16 @@ def fig_linea_tiempo(height=400):
     fig.update_yaxes(title_text=f"Registros cada {ETIQUETA[SIZE_S]}",
                      title_font_color=MUTED, rangemode="tozero")
     fig.update_xaxes(rangeslider=dict(visible=True, thickness=0.06, bgcolor="rgba(0,0,0,0)"))
+    if rango:
+        fig.update_xaxes(range=[rango[0], rango[1]])
+    # uirevision: conserva el zoom del usuario entre recálculos; cambia con "Ver todo"
+    fig.update_layout(uirevision=st.session_state.get("tl_ver", 0))
     return estilo(fig, height=height)
 
 
-def fig_tipos():
-    ct = (REL.groupby(["TIPO_ATAQUE", "CONFIANZA"]).size().unstack(fill_value=0)
+def fig_tipos(rel=None):
+    rel = REL if rel is None else rel
+    ct = (rel.groupby(["TIPO_ATAQUE", "CONFIANZA"]).size().unstack(fill_value=0)
           .reindex(columns=["alta", "media", "baja"], fill_value=0))
     ct = ct.loc[ct.sum(axis=1).sort_values().index]
     fig = go.Figure()
@@ -699,17 +832,26 @@ def tabla_eventos(df, alto=None):
 # Secciones
 def pagina_resumen():
     encabezado("Resumen", "Detección de anomalías en SAP", " ")
-
-    # Todo sale de RESULT_SUMMARY (una fila por semana): se suman las semanas del periodo.
-    n_win = int(RES["VENTANAS"].sum())
-    n_anom = int(RES["VENTANAS_ANOMALAS"].sum())
-    n_ev = int(RES["EVENTOS"].sum())
-    n_rel = int(RES["EVENTOS_RELEVANTES"].sum())
-    # TIPOS_LISTA sin "Falla operativa", que resultados.py (NO_ATAQUE) no cuenta como ataque
-    tipos_ataque = sorted({t.strip() for l in RES["TIPOS_LISTA"].dropna() for t in l.split(",")}
-                          - {"Falla operativa"})
+    rango = PERIODO
+    rel_r = REL
+    if rango:
+        ini, fin = rango
+        n_win, n_anom = len(WIN), int((WIN["LABEL"] == -1).sum())
+        n_ev, n_rel = len(EV), len(REL)
+        tipos_ataque = sorted(set(REL["TIPO_ATAQUE"].dropna()) - {"Falla operativa"})
+        det_bloques = f"del {ini:%d/%m %H:%M} al {fin:%d/%m %H:%M}"
+    else:
+        # Todo sale de RESULT_SUMMARY (una fila por semana): se suman las semanas del periodo.
+        n_win = int(RES["VENTANAS"].sum())
+        n_anom = int(RES["VENTANAS_ANOMALAS"].sum())
+        n_ev = int(RES["EVENTOS"].sum())
+        n_rel = int(RES["EVENTOS_RELEVANTES"].sum())
+        # TIPOS_LISTA sin "Falla operativa", que resultados.py (NO_ATAQUE) no cuenta como ataque
+        tipos_ataque = sorted({t.strip() for l in RES["TIPOS_LISTA"].dropna() for t in l.split(",")}
+                              - {"Falla operativa"})
+        det_bloques = f"{len(RES)} semana(s)"
     kpis = [
-        ("Bloques analizados", f"{n_win:,}", f"{len(RES)} semana(s)",
+        ("Bloques analizados", f"{n_win:,}", det_bloques,
          BRAND, f"La actividad se divide en bloques de {ETIQUETA[SIZE_S]} para analizarla."),
         ("Bloques atípicos", f"{n_anom:,}", f"{n_anom / n_win:.1%} del total" if n_win else "—",
          "#E76500", "Bloques cuyo comportamiento se aleja claramente del habitual."),
@@ -728,23 +870,31 @@ def pagina_resumen():
     with tarjeta("Actividad y eventos en el tiempo",
                  "Volumen de registros a lo largo del periodo. Las franjas de color señalan los "
                  "eventos relevantes según su tipo y los puntos rojos, los bloques atípicos. "
-                 "Usa la barra inferior para acercar un periodo."):
-        mostrar(fig_linea_tiempo())
+                 "Usa la barra inferior o arrastra sobre la gráfica para acercar un periodo: "
+                 "todo el dashboard se recalcula para ese periodo. Doble clic para ver todo."):
+        if rango:
+            r1, r2 = st.columns([4, 1], vertical_alignment="center", gap="medium")
+            r1.html(f'<div class="pm-chips"><span class="pm-chip rango">Periodo seleccionado: '
+                    f'{ini:%d/%m/%Y %H:%M} – {fin:%d/%m/%Y %H:%M}</span></div>')
+            r2.button("Ver todo", icon=":material/zoom_out_map:", width="stretch",
+                      key="tl_limpiar", on_click=limpiar_periodo)
+        grafica_rango(fig=fig_linea_tiempo(rango=rango).to_json(), alto=400, key=CLAVE_TL, default=None)
 
+    sufijo = " en el periodo seleccionado" if rango else ""
     c1, c2 = st.columns([1, 1.15], gap="medium")
     with c1, tarjeta("Eventos relevantes por tipo",
-                     "Cuántos eventos se asignaron a cada tipo y con qué nivel de confianza."):
-        if REL.empty:
-            vacio("No se detectaron eventos relevantes con este intervalo de análisis.")
+                     "Cuántos eventos se asignaron a cada tipo y con qué nivel de confianza" + sufijo + "."):
+        if rel_r.empty:
+            vacio("No hay eventos relevantes" + (sufijo or " con este intervalo de análisis") + ".")
         else:
-            mostrar(fig_tipos())
+            mostrar(fig_tipos(rel_r))
     with c2, tarjeta("Eventos de mayor intensidad",
-                     "Los cinco eventos que más se alejaron del comportamiento habitual. "
+                     "Los cinco eventos que más se alejaron del comportamiento habitual" + sufijo + ". "
                      "Consulta el detalle completo en la sección Eventos."):
-        if REL.empty:
-            vacio("No se detectaron eventos relevantes.")
+        if rel_r.empty:
+            vacio("No hay eventos relevantes" + sufijo + ".")
         else:
-            top = REL.nlargest(5, "Z_MAX")
+            top = rel_r.nlargest(5, "Z_MAX")
             st.dataframe(
                 top[["EVENTO_ID", "TIPO_ATAQUE", "INICIO", "Z_MAX", "INDICADOR"]],
                 hide_index=True,
@@ -758,14 +908,17 @@ def pagina_resumen():
                     "INDICADOR": "Indicador más afectado",
                 })
 
-    if not pm_all.empty:
-        n_tipos_pm = int(pm_all["TIPO_ATAQUE"].dropna().astype(str).nunique())
+    pm_r = pm_all
+    if not PM_MES.empty:
+        n_tipos_pm = int(pm_r["TIPO_ATAQUE"].dropna().astype(str).nunique())
         with tarjeta("Reportes forenses",
-                     "Reportes que generó el agente forense para los eventos relevantes del periodo."):
+                     "Reportes que generó el agente forense para los eventos relevantes"
+                     + (sufijo if rango else " del periodo") + "."):
             k1, k2 = st.columns([4, 1], vertical_alignment="center", gap="medium")
             with k1:
                 st.html('<div class="pm-chips">'
-                        f'<span class="pm-chip">{len(pm_all)} reporte(s) en el periodo</span>'
+                        f'<span class="pm-chip">{len(pm_r)} reporte(s)'
+                        f'{" en el rango" if rango else " en el periodo"}</span>'
                         f'<span class="pm-chip">{n_tipos_pm} tipo(s) de ataque</span></div>')
             with k2:
                 st.page_link(pg_postmortems, label="Ver reportes", icon=":material/arrow_forward:")
@@ -777,13 +930,14 @@ def pagina_eventos():
                "aspectos de la actividad cambiaron y el detalle de cada uno.")
     if EV.empty:
         with tarjeta():
-            vacio("No se detectaron eventos con los filtros seleccionados.")
+            vacio("No se detectaron eventos con los filtros seleccionados"
+                  + (" en el periodo seleccionado." if PERIODO else "."))
         return
 
     with tarjeta("Aspectos afectados en cada evento",
                  "Qué tanto cambió cada grupo de indicadores durante el evento, comparado con una "
                  "semana normal. Los tonos más oscuros indican un cambio mayor."):
-        perfil = perfil_relevantes(WIN, REL, FAMILIAS[STREAM])
+        perfil = perfil_relevantes(WIN_MES, REL, FAMILIAS[STREAM])   # z contra la semana completa
         if perfil.empty:
             vacio("No hay eventos relevantes para mostrar.")
         else:
@@ -830,8 +984,9 @@ def pagina_tipos():
     tarjetas = []
     for t in tipos:
         n = int(conteo.get(t, 0))
-        chips = (f'<span class="chip alerta">{n} evento{"s" if n != 1 else ""} en el periodo</span>'
-                 if n else '<span class="chip nada">Sin eventos en el periodo</span>')
+        donde = "en el periodo seleccionado" if PERIODO else "en el periodo"
+        chips = (f'<span class="chip alerta">{n} evento{"s" if n != 1 else ""} {donde}</span>'
+                 if n else f'<span class="chip nada">Sin eventos {donde}</span>')
         if t in TIPOS_NO_ATAQUE:
             chips += '<span class="chip info">No cuenta como ataque</span>'
         senales = "".join(f'<li><span>{flecha[sg[t]]}</span>{nombre(f)} {texto_dir[sg[t]]}</li>'
@@ -875,8 +1030,13 @@ def pagina_modelo():
     with c3, tarjeta("Resultados según el intervalo de análisis",
                      "Con intervalos cortos se detectan más eventos breves; con intervalos largos, "
                      "solo los que se sostienen en el tiempo."):
-        s = (RES_S.groupby(["WINDOW_SIZE_S", "WINDOW_LABEL"])[["EVENTOS", "EVENTOS_RELEVANTES"]]
-             .sum().reset_index().sort_values("WINDOW_SIZE_S"))
+        ev_s = eventos_all[(eventos_all["SOURCE_TABLE"] == FUENTE) & (eventos_all["STREAM"] == STREAM)]
+        ev_s = en_periodo(ev_s.assign(FIN_REAL=ev_s["FIN"] + pd.to_timedelta(ev_s["WINDOW_SIZE_S"], unit="s")))
+        s = (ev_s.groupby(["WINDOW_SIZE_S", "WINDOW_LABEL"])
+             .agg(EVENTOS=("EVENTO_ID", "size"), EVENTOS_RELEVANTES=("RELEVANTE", "sum"))
+             .reindex(pd.MultiIndex.from_frame(RES_S[["WINDOW_SIZE_S", "WINDOW_LABEL"]].drop_duplicates()),
+                      fill_value=0)
+             .reset_index().sort_values("WINDOW_SIZE_S"))
         fig = go.Figure()
         for colname, nombre, color in (("EVENTOS", "Eventos detectados", SERIES[0]),
                                        ("EVENTOS_RELEVANTES", "Eventos relevantes", SERIES[2])):
@@ -920,7 +1080,13 @@ def pagina_modelo():
         no_eval = int((VALID["ESTADO"] != "evaluable").sum())
         if no_eval:
             st.caption(f"En {no_eval} de {len(VALID)} combinaciones de semana e intervalo no "
-                       "hubo datos suficientes para esta comparación.")
+                       "hubo datos suficientes para esta comparación."
+                       + (" Con un periodo seleccionado se usan las semanas que lo incluyen." if PERIODO else ""))
+
+def titulo_pm(periodo):
+    """Título de Postmortems; "— AAAA-MM" nunca se parte entre dos líneas."""
+    return f'Resumen forense mensual <span style="white-space: nowrap">— {periodo}</span>'
+
 
 def _rango(ini, fin):
     """Fecha y horario del incidente en dos líneas cortas."""
@@ -948,8 +1114,15 @@ def _chips(items, vacio_txt):
 
 def pagina_postmortems():
     periodo = MES.replace("_", "-")
+    if pm_all.empty and not PM_MES.empty:
+        encabezado("Postmortems SOC", titulo_pm(MES.replace('_', '-')),
+                   "Consolidado ejecutivo de todos los incidentes investigados en el periodo.",
+                   pills=[("Periodo", MES.replace("_", "-")), ("Reportes", 0)])
+        vacio(f"No hay reportes en el periodo seleccionado ({TXT_PERIODO}). "
+              f"El mes tiene {len(PM_MES)}; usa Ver todo el mes en la barra lateral para verlos.")
+        return
     if pm_all.empty:
-        encabezado("Postmortems SOC", f"Resumen forense mensual — {periodo}",
+        encabezado("Postmortems SOC", titulo_pm(periodo),
                    "Consolidado ejecutivo de todos los incidentes investigados en el periodo.",
                    pills=[("Periodo", periodo), ("Reportes", 0)])
         vacio(f"Aún no hay reportes para {periodo}. Aparecerán aquí cuando el agente forense "
@@ -983,7 +1156,7 @@ def pagina_postmortems():
         pm_f = pm_f[texto.str.contains(q, regex=False)]
     if pm_f.empty:
         with header_slot:
-            encabezado("Postmortems SOC", f"Resumen forense mensual — {periodo}",
+            encabezado("Postmortems SOC", titulo_pm(periodo),
                        "Consolidado ejecutivo de todos los incidentes investigados en el periodo.",
                        pills=[("Periodo", periodo), ("Reportes", len(pm_all))])
         vacio("Ningún reporte coincide con los filtros.")
@@ -994,19 +1167,19 @@ def pagina_postmortems():
 
     # Cabecera con botones globales de descarga del reporte mensual consolidado
     with header_slot:
-        h_left, h_right = st.columns([1.85, 1.15], vertical_alignment="bottom", gap="large")
+        h_left, h_right = st.columns([1.75, 1.25], vertical_alignment="bottom", gap="medium")
         with h_left:
-            encabezado("Postmortems SOC", f"Resumen forense mensual — {periodo}",
+            encabezado("Postmortems SOC", titulo_pm(periodo),
                        "Resumen consolidado de todos los incidentes investigados del mes y "
                        "exportación ejecutiva multipágina.",
                        pills=[("Periodo", periodo), ("Incidentes", len(pm_f))])
         with h_right:
-            b1, b2 = st.columns([1.2, 1.0], gap="small")
+            b1, b2 = st.columns(2, gap="small")
             with b1:
                 try:
                     pdf_mes = _construir_pdf_mensual_bytes(pm_f, periodo)
                     st.download_button(
-                        "Descargar PDF del Mes",
+                        "Descargar PDF",
                         data=pdf_mes,
                         file_name=f"Postmortem_SOC_{MES}.pdf",
                         mime="application/pdf",
@@ -1020,7 +1193,7 @@ def pagina_postmortems():
             with b2:
                 md_mes = _construir_markdown_mensual(pm_f, periodo)
                 st.download_button(
-                    "Markdown (.md)",
+                    "Descargar Markdown",
                     data=md_mes.encode("utf-8"),
                     file_name=f"Postmortem_SOC_{MES}.md",
                     mime="text/markdown",
@@ -1216,6 +1389,541 @@ def pagina_postmortems():
                     st.divider()
 
 
+# ---------------------------------------------------------------------------
+# MLOps: health checks del sistema y entrenamiento en vivo
+# ---------------------------------------------------------------------------
+ESTADOS_HC = {  # estado -> (texto, clase CSS, color)
+    "ok": ("Correcto", "ok", "#188918"),
+    "warn": ("Atención", "warn", "#E76500"),
+    "fail": ("Falla", "fail", CRITICO),
+    "info": ("Informativo", "info", BRAND),
+}
+TABLAS_RESULTADO = ("EVENTS", "SUMMARY", "VALIDATION", "WINDOWS_SYSTEM", "WINDOWS_LLM")
+
+
+@st.cache_data(ttl=60, show_spinner=False)
+def inventario_hana():
+    """Tablas de logs y de resultados del esquema, con registros y fecha de creación."""
+    return _conn().sql(
+        "SELECT t.TABLE_NAME, m.RECORD_COUNT, t.CREATE_TIME FROM TABLES t "
+        "JOIN M_TABLES m ON m.SCHEMA_NAME = t.SCHEMA_NAME AND m.TABLE_NAME = t.TABLE_NAME "
+        "WHERE t.SCHEMA_NAME = CURRENT_SCHEMA "
+        "AND (t.TABLE_NAME LIKE 'LOGS%' OR t.TABLE_NAME LIKE 'RESULT%') ORDER BY t.TABLE_NAME"
+    ).collect()
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def version_hana():
+    return str(_conn().sql("SELECT VERSION FROM M_DATABASE").collect().iloc[0, 0])
+
+
+@st.cache_data(ttl=60, show_spinner=False)
+def metricas_pipeline(meses_proc):
+    """Por mes procesado: resumen, validación, conteos por stream y postmortems."""
+    res, val, pm = [], [], []
+    for m in meses_proc:
+        res.append(leer("SUMMARY", m).assign(MES=m))
+        val.append(leer("VALIDATION", m).assign(MES=m))
+        p = leer_postmortems(m)
+        if not p.empty:
+            pm.append(p.assign(MES=m))
+    return (pd.concat(res, ignore_index=True), pd.concat(val, ignore_index=True),
+            pd.concat(pm, ignore_index=True) if pm else pd.DataFrame())
+
+
+def _ping_hana():
+    t = time.perf_counter()
+    cur = _conn().connection.cursor()
+    cur.execute("SELECT 1 FROM DUMMY")
+    cur.close()
+    return (time.perf_counter() - t) * 1000
+
+
+def health_checks():
+    """Lista de verificaciones: (grupo, nombre, estado, valor, detalle)."""
+    hc = []
+    # Infraestructura
+    try:
+        ms = _ping_hana()
+        hc.append(("Infraestructura", "Conexión a SAP HANA Cloud",
+                   "ok" if ms < 500 else "warn" if ms < 2000 else "fail", f"{ms:.0f} ms",
+                   "Tiempo de respuesta de una consulta mínima (SELECT 1 FROM DUMMY)."))
+    except Exception as e:
+        hc.append(("Infraestructura", "Conexión a SAP HANA Cloud", "fail", "Sin conexión", str(e)[:160]))
+        return hc
+    hc.append(("Infraestructura", "Versión de SAP HANA", "info", version_hana(),
+               "Motor donde corren las ventanas, Isolation Forest y K-means (PAL)."))
+    gemini = bool(os.getenv("GEMINI_API_KEY"))
+    hc.append(("Infraestructura", "Credencial de Gemini en este entorno", "ok" if gemini else "info",
+               "Configurada" if gemini else "No configurada",
+               "Este entorno puede generar reportes con Gemini." if gemini else
+               "El dashboard no la necesita: el worker de Cloud Foundry usa su propia llave "
+               "(ver Redacción con Gemini)."))
+
+    inv = inventario_hana()
+    logs = inv[inv["TABLE_NAME"].str.startswith("LOGS")]
+    res_tab = inv[inv["TABLE_NAME"].str.startswith("RESULT_")]
+    meses_proc = sorted({t.rsplit("_", 2)[-2] + "_" + t.rsplit("_", 2)[-1]
+                         for t in res_tab["TABLE_NAME"] if t.startswith("RESULT_SUMMARY_")})
+    resumen, valid, pms = metricas_pipeline(tuple(meses_proc))
+
+    # Datos
+    procesadas = set(resumen["SOURCE_TABLE"].unique())
+    pendientes = sorted(set(logs["TABLE_NAME"]) - procesadas)
+    hc.append(("Datos", "Cobertura del pipeline",
+               "ok" if not pendientes else "warn",
+               f"{len(procesadas)} de {len(logs)} tablas",
+               "Todas las tablas de logs tienen resultados." if not pendientes else
+               "Sin procesar: " + ", ".join(pendientes) + "."))
+    faltan, descuadres = [], []
+    conteo = dict(zip(inv["TABLE_NAME"], inv["RECORD_COUNT"]))
+    for m in meses_proc:
+        faltan += [f"RESULT_{t}_{m}" for t in TABLAS_RESULTADO if f"RESULT_{t}_{m}" not in conteo]
+        r = resumen[resumen["MES"] == m]
+        for stx, tabla in (("system", f"RESULT_WINDOWS_SYSTEM_{m}"), ("llm", f"RESULT_WINDOWS_LLM_{m}")):
+            esperado = int(r.loc[r["STREAM"] == stx, "VENTANAS"].sum())
+            if tabla in conteo and int(conteo[tabla]) != esperado:
+                descuadres.append(f"{tabla}: {int(conteo[tabla]):,} vs {esperado:,}")
+    hc.append(("Datos", "Integridad de resultados", "fail" if faltan or descuadres else "ok",
+               f"{len(meses_proc)} periodo(s)",
+               ("Faltan: " + ", ".join(faltan) + ". " if faltan else "")
+               + ("Ventanas no cuadran: " + "; ".join(descuadres) + "." if descuadres else "")
+               or "Las 5 tablas por periodo existen y las ventanas guardadas cuadran con el resumen."))
+    ult = pd.to_datetime(res_tab.loc[~res_tab["TABLE_NAME"].str.startswith("RESULT_POSTMORTEMS"),
+                                     "CREATE_TIME"]).max()
+    dias = (pd.Timestamp.now() - ult).days if pd.notna(ult) else None
+    hc.append(("Datos", "Frescura de resultados",
+               "ok" if dias is not None and dias <= 7 else "warn",
+               f"hace {dias} día(s)" if dias is not None else "N/A",
+               f"Última carga del pipeline: {ult:%d/%m/%Y %H:%M}. Se espera un lote nuevo cada semana."
+               if pd.notna(ult) else "No hay tablas de resultados."))
+
+    # Modelo
+    try:
+        for stx in STREAMS:
+            validar_firmas(wf.FEATURES[stx], firmas=wf.FIRMAS[stx])
+        hc.append(("Modelo", "Firmas de clasificación", "ok", "24 + 18 variables",
+                   "Cada variable del Isolation Forest tiene firma y no sobran firmas."))
+    except Exception as e:
+        hc.append(("Modelo", "Firmas de clasificación", "fail", "Inconsistentes", str(e)[:160]))
+    tasa = resumen.groupby("STREAM")[["VENTANAS_ANOMALAS", "VENTANAS"]].sum()
+    tasa = (tasa["VENTANAS_ANOMALAS"] / tasa["VENTANAS"]).to_dict()
+    fuera = {k: v for k, v in tasa.items() if not 0.005 <= v <= 0.02}
+    hc.append(("Modelo", "Tasa de anomalías", "ok" if not fuera else "warn",
+               "\n".join(f"{STREAMS[k]} {v:.2%}" for k, v in tasa.items()),
+               f"Debe rondar la contaminación configurada ({CONTAMINATION_IF:.0%}). Tolerancia: 0.5 % a 2 %."))
+    ev_ok = valid[valid["ESTADO"] == "evaluable"]
+    ari = ev_ok.groupby("STREAM")["ARI"].mean().to_dict()
+    ari_min = min(ari.values()) if ari else None
+    hc.append(("Modelo", "Consistencia tipos vs. clústeres",
+               "info" if ari_min is None else "ok" if ari_min >= 0.5 else "warn" if ari_min >= 0.3 else "fail",
+               "\n".join(f"{STREAMS[k]} ARI {v:.2f}" for k, v in ari.items()) or "Sin semanas evaluables",
+               f"Promedio sobre {len(ev_ok)} semana(s) evaluables. Correcto con ARI ≥ 0.5."))
+
+    # Agente forense
+    if pms.empty:
+        hc.append(("Agente forense", "Reportes postmortem", "warn", "0", "Aún no hay reportes generados."))
+    else:
+        gen = pms["METADATA_JSON"].map(lambda j: _parse_json_safe(j).get("generador", "N/A"))
+        n_llm = int((gen == "gemini_api").sum())
+        ultimo = pd.to_datetime(pms["FECHA_GENERACION"]).max()
+        hc.append(("Agente forense", "Reportes postmortem", "ok", f"{len(pms)} reportes",
+                   f"En {pms['MES'].nunique()} periodo(s). Último generado el {ultimo:%d/%m/%Y %H:%M}."))
+        hc.append(("Agente forense", "Redacción con Gemini",
+                   "ok" if n_llm == len(pms) else "warn", f"{n_llm} de {len(pms)}",
+                   "Reportes redactados por Gemini; el resto usó el motor determinístico de respaldo."))
+    return hc
+
+
+def _html_checks(hc):
+    grupos = {}
+    for g, *resto in hc:
+        grupos.setdefault(g, []).append(resto)
+    out = '<div class="hc-grid">'
+    for g, filas in grupos.items():
+        out += f'<div class="hc-group"><p class="hc-gtitle">{html.escape(g)}</p>'
+        for nombre, estado, valor, detalle in filas:
+            txt, cls, _ = ESTADOS_HC[estado]
+            out += (f'<div class="hc-row"><i class="hc-dot {cls}"></i>'
+                    f'<div class="hc-main"><b>{html.escape(nombre)}</b>'
+                    f'<span>{html.escape(detalle)}</span></div>'
+                    f'<div class="hc-val"><b>{html.escape(str(valor))}</b>'
+                    f'<span class="hc-pill {cls}">{txt}</span></div></div>')
+        out += '</div>'
+    return out + '</div>'
+
+
+def _vista_health():
+    t0 = time.perf_counter()
+    with st.spinner("Revisando el sistema…"):
+        hc = health_checks()
+    cuenta = {k: sum(1 for c in hc if c[2] == k) for k in ESTADOS_HC}
+    general = "fail" if cuenta["fail"] else "warn" if cuenta["warn"] else "ok"
+    inv = inventario_hana()
+    logs = inv[inv["TABLE_NAME"].str.startswith("LOGS")]
+    lat = next((c[3] for c in hc if c[1] == "Conexión a SAP HANA Cloud"), "N/A")
+    kpis = [
+        ("Estado general", ESTADOS_HC[general][0],
+         f"{cuenta['ok']} correctas · {cuenta['warn']} con atención · {cuenta['fail']} con falla",
+         ESTADOS_HC[general][2], "Resultado combinado de todas las verificaciones."),
+        ("Latencia de HANA", lat, "consulta mínima", BRAND, "Tiempo de respuesta de SAP HANA Cloud."),
+        ("Registros en HANA", f"{logs['RECORD_COUNT'].sum() / 1e6:,.1f} M",
+         f"en {len(logs)} tablas de logs", "#7858FF", "Registros de logs cargados en el esquema."),
+        ("Última revisión", time.strftime("%H:%M:%S"), f"tomó {time.perf_counter() - t0:.1f} s", "#049F9A",
+         "Las verificaciones se recalculan al abrir la vista o con el botón Volver a revisar."),
+    ]
+    st.html('<div class="kpis kpis-4">' + "".join(
+        f'<div class="kpi" style="--c:{c}" title="{html.escape(ayuda)}"><div class="lab"><i></i>{lab}</div>'
+        f'<div class="val">{val}</div><div class="det">{det}</div></div>'
+        for lab, val, det, c, ayuda in kpis) + '</div>')
+
+    with tarjeta("Verificaciones del sistema",
+                 "Estado de la infraestructura, los datos, el modelo y el agente forense."):
+        if st.button("Volver a revisar", icon=":material/refresh:", key="hc_refrescar"):
+            inventario_hana.clear()
+            metricas_pipeline.clear()
+            leer_postmortems.clear()
+            st.rerun()
+        st.html(_html_checks(hc))
+
+    meses_proc = sorted({t[len("RESULT_SUMMARY_"):] for t in inv["TABLE_NAME"]
+                         if t.startswith("RESULT_SUMMARY_")})
+    resumen, _, _ = metricas_pipeline(tuple(meses_proc))
+    c1, c2 = st.columns(2, gap="medium")
+    with c1, tarjeta("Tasa de anomalías por intervalo",
+                     "Proporción de ventanas marcadas como anómalas. La línea punteada es la "
+                     "contaminación configurada en el modelo (1 %)."):
+        t = (resumen.groupby(["WINDOW_SIZE_S", "WINDOW_LABEL", "STREAM"])
+             [["VENTANAS_ANOMALAS", "VENTANAS"]].sum().reset_index().sort_values("WINDOW_SIZE_S"))
+        t["TASA"] = t["VENTANAS_ANOMALAS"] / t["VENTANAS"]
+        fig = go.Figure()
+        for i, stx in enumerate(STREAMS):
+            d = t[t["STREAM"] == stx]
+            fig.add_trace(go.Bar(x=d["WINDOW_LABEL"], y=d["TASA"], name=STREAMS[stx],
+                                 marker=dict(color=SERIES[i], cornerradius=4),
+                                 hovertemplate="%{x}: %{y:.2%}<extra>" + STREAMS[stx] + "</extra>"))
+        fig.add_hline(y=CONTAMINATION_IF, line=dict(color=CRITICO, dash="dot", width=1.5))
+        fig.update_yaxes(tickformat=".1%", rangemode="tozero")
+        mostrar(estilo(fig, height=300))
+    with c2, tarjeta("Volumen y cobertura de los logs",
+                     "Registros por tabla de logs en HANA. En azul, las que ya pasaron por el "
+                     "pipeline; en gris, las pendientes."):
+        proc = set(resumen["SOURCE_TABLE"])
+        d = logs.sort_values("TABLE_NAME", ascending=False)
+        fig = go.Figure(go.Bar(
+            y=d["TABLE_NAME"], x=d["RECORD_COUNT"] / 1e6, orientation="h",
+            marker=dict(color=[BRAND if n in proc else NEUTRO for n in d["TABLE_NAME"]], cornerradius=4),
+            text=[f"{v / 1e6:.1f} M" for v in d["RECORD_COUNT"]], textposition="outside",
+            textfont=dict(color=INK2, size=11), cliponaxis=False,
+            hovertemplate="%{y}: %{x:.2f} M registros<extra></extra>"))
+        fig.update_xaxes(title_text="Millones de registros", title_font_color=MUTED)
+        mostrar(estilo(fig, height=300, legend=False, margin=dict(l=8, r=40, t=8, b=40)))
+
+    with tarjeta("Inventario de tablas en SAP HANA",
+                 "Tablas de logs y de resultados del esquema, con su número de registros."):
+        inv2 = inv.assign(TIPO=np.where(inv["TABLE_NAME"].str.startswith("LOGS"), "Logs", "Resultados"))
+        st.dataframe(inv2[["TABLE_NAME", "TIPO", "RECORD_COUNT", "CREATE_TIME"]], hide_index=True,
+                     column_config={
+                         "TABLE_NAME": "Tabla", "TIPO": "Tipo",
+                         "RECORD_COUNT": st.column_config.NumberColumn("Registros", format="localized"),
+                         "CREATE_TIME": st.column_config.DatetimeColumn("Creada", format="DD/MM/YYYY HH:mm"),
+                     })
+
+
+# --- Entrenamiento en vivo -------------------------------------------------
+PASOS = [
+    ("Conexión a SAP HANA", "Abre una sesión propia para las tablas temporales."),
+    ("Selección de la semana", "Filtra los registros de la tabla a la semana elegida."),
+    ("Eventos base", "Convierte timestamps y calcula banderas por registro."),
+    ("Construcción de ventanas", "Agrega los registros en ventanas con 50 % de traslape."),
+    ("Entrenamiento de Isolation Forest", "PAL ajusta el bosque de árboles de aislamiento."),
+    ("Puntuación de ventanas", "Score de anomalía y etiqueta para cada ventana."),
+    ("Eventos, relevancia y tipo", "Agrupa anomalías, filtra por |z| y asigna el tipo de ataque."),
+    ("Limpieza", "Borra las tablas temporales y cierra la sesión."),
+]
+
+
+@st.cache_data(ttl=600, show_spinner=False)
+def semanas_de(tabla):
+    t0, t_max, n = calculate_week_range(_conn(), tabla, wf.WEEK_DAYS, wf.MIN_LAST_DAYS)
+    return tabla_semanas(t0, t_max, n, wf.WEEK_DAYS)
+
+
+def _html_pasos(estado, dur):
+    iconos = {"pendiente": "", "corriendo": "", "ok": "✓", "error": "!"}
+    out = '<div class="tr-steps">'
+    for i, ((nom, desc), e, d) in enumerate(zip(PASOS, estado, dur), 1):
+        t = f"{d:.1f} s" if d is not None else ("en curso…" if e == "corriendo" else "")
+        out += (f'<div class="tr-step {e}"><span class="tr-num">{iconos[e] or i}</span>'
+                f'<div><b>{nom}</b><span>{desc}</span></div><em>{t}</em></div>')
+    return out + '</div>'
+
+
+def _correr_entrenamiento(tabla, semana, size_s, stream, ui):
+    """Ejecuta el pipeline de una semana con el código de producción, mostrando cada paso en vivo."""
+    estado, dur, lineas = ["pendiente"] * len(PASOS), [None] * len(PASOS), []
+    t_ini = time.perf_counter()
+    feats = wf.FEATURES[stream]
+    es_sys = stream == "system"
+
+    def log(msg):
+        lineas.append(f"[{time.strftime('%H:%M:%S')}] {msg}")
+        ui["log"].code("\n".join(lineas[-18:]), language=None, wrap_lines=True)
+
+    def pintar():
+        hechos = sum(e == "ok" for e in estado)
+        ui["pasos"].html(_html_pasos(estado, dur))
+        txt = (f"Completado en {time.perf_counter() - t_ini:.0f} s" if hechos == len(PASOS) else
+               f"Paso {hechos + 1} de {len(PASOS)} · {time.perf_counter() - t_ini:.0f} s transcurridos")
+        ui["prog"].progress(hechos / len(PASOS), text=txt)
+
+    @contextmanager
+    def paso(i):
+        estado[i] = "corriendo"
+        pintar()
+        log(f"Inicia: {PASOS[i][0]}")
+        t = time.perf_counter()
+        try:
+            yield
+        except Exception:
+            estado[i], dur[i] = "error", time.perf_counter() - t
+            pintar()
+            raise
+        estado[i], dur[i] = "ok", time.perf_counter() - t
+        pintar()
+
+    conn, res = None, {"tabla": tabla, "semana": semana, "size_s": size_s, "stream": stream}
+    try:
+        with paso(0):
+            conn = hana_df.ConnectionContext(**_params(), communicationTimeout=600000)
+            log("Sesión dedicada abierta: las tablas temporales (#) solo existen en ella.")
+        with paso(1):
+            df_sys, df_llm = wf.cargar_datos(conn, tabla)
+            sw, lw, sem = split_into_weeks(df_sys, df_llm, conn, tabla, wf.WEEK_DAYS, wf.MIN_LAST_DAYS)
+            df_w = (sw if es_sys else lw)[semana]
+            res["registros"] = int(df_w.count())
+            fila = sem.iloc[semana]
+            log(f"{tabla} · semana {semana + 1} ({fila['WEEK_START']:%d/%m} – {fila['WEEK_END']:%d/%m}): "
+                f"{res['registros']:,} registros de {STREAMS[stream]}.")
+        with paso(2):
+            (ventanas_mod.prepare_system_base if es_sys else ventanas_mod.prepare_llm_base)(conn, df_w)
+            log("Eventos base materializados en " + ("#BASE_SYSTEM." if es_sys else "#BASE_LLM."))
+        with paso(3):
+            build = ventanas_mod.build_system_windows if es_sys else ventanas_mod.build_llm_windows
+            win = ventanas_mod.materialize(conn, build(conn, size_s), "#WIN_SYSTEM" if es_sys else "#WIN_LLM")
+            ventanas_mod.drop_temp(conn, ventanas_mod.SYSTEM_EVENTS_TABLE if es_sys
+                                   else ventanas_mod.LLM_EVENTS_TABLE)
+            res["ventanas"] = int(win.count())
+            log(f"{res['ventanas']:,} ventanas de {ventanas_mod.size_label(size_s)} con {len(feats)} variables.")
+        with paso(4):
+            n = res["ventanas"]
+            model = PalIsolationForest(n_estimators=IF_N_ESTIMATORS, max_samples=min(IF_MAX_SAMPLES, n),
+                                       random_state=IF_RANDOM_STATE)
+            log(f"Parámetros: n_estimators={IF_N_ESTIMATORS}, max_samples={min(IF_MAX_SAMPLES, n)}, "
+                f"random_state={IF_RANDOM_STATE}.")
+            t_fit = time.perf_counter()
+            model.fit(data=win, key="WINDOW_INDEX", features=feats)
+            res["t_fit"] = time.perf_counter() - t_fit
+            log(f"Modelo ajustado en SAP HANA PAL en {res['t_fit']:.1f} s.")
+        with paso(5):
+            pred = model.predict(data=win, key="WINDOW_INDEX", features=feats,
+                                 contamination=CONTAMINATION_IF, show_explainer=False)
+            win_pdf = win.collect()
+            r = win_pdf.merge(pred.collect(), on="WINDOW_INDEX")
+            idx = r.loc[r["LABEL"] == -1, "WINDOW_INDEX"].tolist()
+            z = zscores(win_pdf, idx, feats)
+            res["anomalas"] = len(idx)
+            log(f"{len(idx)} ventanas anómalas ({len(idx) / len(r):.2%}) con contaminación {CONTAMINATION_IF}.")
+        with paso(6):
+            r.insert(0, "WEEK", semana)
+            z.insert(0, "WEEK", semana)
+            r = agrupar_eventos(r, wf.MAX_GAP[size_s][stream])
+            ev = resumen_eventos(r)
+            ev = marcar_relevantes(r, z, ev, wf.Z_UMBRAL[size_s])
+            tipos = clasificar_eventos(r, z, ev, firmas=wf.FIRMAS[stream])
+            ev = ev.merge(tipos, on="EVENTO_ID", how="left")
+            res.update(eventos=len(ev), relevantes=int(ev["RELEVANTE"].sum()), ev=ev, win=r)
+            log(f"{len(ev)} eventos; {res['relevantes']} relevantes (|z| ≥ {wf.Z_UMBRAL[size_s]}).")
+            for _, e in ev[ev["RELEVANTE"]].iterrows():
+                log(f"  Evento {int(e['EVENTO_ID'])}: {e['TIPO_ATAQUE']} (confianza {e['CONFIANZA']}, "
+                    f"z máx {e['Z_MAX']:.1f} en {e['Z_MAX_FEATURE']}).")
+        with paso(7):
+            ventanas_mod.drop_temp(conn, "#WIN_SYSTEM" if es_sys else "#WIN_LLM")
+            ventanas_mod.drop_temp(conn, ventanas_mod.SYSTEM_BASE_TABLE if es_sys
+                                   else ventanas_mod.LLM_BASE_TABLE)
+            conn.close()
+            conn = None
+            log("Tablas temporales borradas. No se modificó ninguna tabla RESULT_*.")
+        res["total"] = time.perf_counter() - t_ini
+        res["durs"] = dur
+        log(f"Entrenamiento completo en {res['total']:.0f} s.")
+        res["log"] = lineas
+        return res
+    except Exception as e:
+        log(f"ERROR: {e}")
+        st.error(f"El entrenamiento se detuvo: {e}")
+        return None
+    finally:
+        if conn is not None:
+            try:
+                conn.close()
+            except Exception:
+                pass
+
+
+def _comparar_con_produccion(res):
+    """Compara la corrida con lo que el pipeline guardó en RESULT_SUMMARY para la misma semana."""
+    inv = inventario_hana()
+    meses_proc = sorted({t[len("RESULT_SUMMARY_"):] for t in inv["TABLE_NAME"]
+                         if t.startswith("RESULT_SUMMARY_")})
+    resumen, _, _ = metricas_pipeline(tuple(meses_proc))
+    g = resumen[(resumen["SOURCE_TABLE"] == res["tabla"]) & (resumen["WINDOW_SIZE_S"] == res["size_s"])
+                & (resumen["STREAM"] == res["stream"]) & (resumen["WEEK"] == res["semana"])]
+    with tarjeta("Comparación con producción",
+                 "Verifica que el entrenamiento sea reproducible: con la misma semilla (random_state = 42) "
+                 "debe obtener lo mismo que guardó el pipeline en RESULT_SUMMARY."):
+        if g.empty:
+            st.html('<div class="hc-group"><div class="hc-row"><i class="hc-dot info"></i>'
+                    '<div class="hc-main"><b>Sin referencia</b><span>Esta tabla aún no se procesa en '
+                    'producción, así que no hay resultados guardados para comparar.</span></div>'
+                    '<div class="hc-val"><span class="hc-pill info">Informativo</span></div></div></div>')
+            return
+        g = g.iloc[0]
+        filas = [("Ventanas", res["ventanas"], int(g["VENTANAS"])),
+                 ("Ventanas anómalas", res["anomalas"], int(g["VENTANAS_ANOMALAS"])),
+                 ("Eventos", res["eventos"], int(g["EVENTOS"])),
+                 ("Eventos relevantes", res["relevantes"], int(g["EVENTOS_RELEVANTES"]))]
+        out = '<div class="hc-grid">'
+        for i in range(0, len(filas), 2):
+            out += '<div class="hc-group">'
+            for nom, vivo, prod in filas[i:i + 2]:
+                cls = "ok" if vivo == prod else "warn"
+                out += (f'<div class="hc-row"><i class="hc-dot {cls}"></i><div class="hc-main"><b>{nom}</b>'
+                        f'<span>Esta corrida: {vivo:,} · Guardado en producción: {prod:,}</span></div>'
+                        f'<div class="hc-val"><span class="hc-pill {cls}">'
+                        f'{"Coincide" if vivo == prod else "Difiere"}</span></div></div>')
+            out += '</div>'
+        st.html(out + '</div>')
+
+
+def _resultado_entrenamiento(res):
+    r, ev = res["win"], res["ev"]
+    kpis = [
+        ("Ventanas", f"{res['ventanas']:,}", f"de {ventanas_mod.size_label(res['size_s'])}", BRAND,
+         "Ventanas construidas para la semana."),
+        ("Ventanas anómalas", f"{res['anomalas']}", f"{res['anomalas'] / res['ventanas']:.2%} del total",
+         "#E76500", "Marcadas por Isolation Forest."),
+        ("Eventos relevantes", f"{res['relevantes']}", f"de {res['eventos']} eventos", CRITICO,
+         "Eventos con |z| ≥ 5 en alguna variable."),
+        ("Tiempo total", f"{res['total']:.0f} s", f"entrenamiento: {res['t_fit']:.1f} s", "#049F9A",
+         "Duración de todo el proceso y del ajuste del modelo."),
+    ]
+    st.html('<div class="kpis kpis-4">' + "".join(
+        f'<div class="kpi" style="--c:{c}" title="{ayuda}"><div class="lab"><i></i>{lab}</div>'
+        f'<div class="val">{val}</div><div class="det">{det}</div></div>'
+        for lab, val, det, c, ayuda in kpis) + '</div>')
+
+    _comparar_con_produccion(res)
+
+    c1, c2 = st.columns([1.6, 1], gap="medium")
+    with c1, tarjeta("Puntaje de anomalía en el tiempo",
+                     "Score de cada ventana de la semana. Los puntos rojos son las ventanas anómalas."):
+        a = r[r["LABEL"] == -1]
+        fig = go.Figure([
+            go.Scatter(x=r["WINDOW_START"], y=r["SCORE"], mode="lines", name="Score",
+                       line=dict(color=SERIES[0], width=1.2)),
+            go.Scatter(x=a["WINDOW_START"], y=a["SCORE"], mode="markers", name="Anómala",
+                       marker=dict(color=CRITICO, size=6)),
+        ])
+        fig.update_yaxes(title_text="Score", title_font_color=MUTED)
+        mostrar(estilo(fig, height=300))
+    with c2, tarjeta("Distribución del puntaje",
+                     "Histograma de scores. La línea marca el umbral a partir del cual una ventana "
+                     "se considera anómala."):
+        umbral = float(r.loc[r["LABEL"] == -1, "SCORE"].min())
+        fig = go.Figure(go.Histogram(x=r["SCORE"], nbinsx=40, marker=dict(color=SERIES[0]),
+                                     hovertemplate="Score %{x}<br>%{y} ventanas<extra></extra>"))
+        fig.add_vline(x=umbral, line=dict(color=CRITICO, dash="dot", width=1.5))
+        fig.update_yaxes(title_text="Ventanas", title_font_color=MUTED)
+        mostrar(estilo(fig, height=300, legend=False))
+
+    with tarjeta("Eventos detectados en esta corrida",
+                 "Eventos agrupados a partir de las ventanas anómalas, ordenados por intensidad."):
+        if ev.empty:
+            vacio("No se formaron eventos.")
+        else:
+            st.dataframe(ev.sort_values("Z_MAX", ascending=False)[
+                ["EVENTO_ID", "INICIO", "N_VENTANAS", "Z_MAX", "Z_MAX_FEATURE", "RELEVANTE",
+                 "TIPO_ATAQUE", "CONFIANZA"]].assign(Z_MAX_FEATURE=lambda d: d["Z_MAX_FEATURE"].map(nombre)),
+                hide_index=True, column_config={
+                    "EVENTO_ID": st.column_config.NumberColumn("Evento", format="%d"),
+                    "INICIO": st.column_config.DatetimeColumn("Inicio", format="DD/MM HH:mm"),
+                    "N_VENTANAS": st.column_config.NumberColumn("Ventanas", format="%d"),
+                    "Z_MAX": st.column_config.NumberColumn("Intensidad", format="%.1f"),
+                    "Z_MAX_FEATURE": "Indicador más afectado",
+                    "RELEVANTE": st.column_config.CheckboxColumn("Relevante"),
+                    "TIPO_ATAQUE": "Tipo de ataque", "CONFIANZA": "Confianza",
+                })
+
+
+def _vista_entrenamiento():
+    inv = inventario_hana()
+    tablas = sorted(inv.loc[inv["TABLE_NAME"].str.startswith("LOGS"), "TABLE_NAME"])
+    with tarjeta("Configuración de la corrida",
+                 "Corre el mismo código del pipeline de producción (src/workflow.py) sobre una semana, "
+                 "en tablas temporales de SAP HANA. No modifica los resultados guardados."):
+        f1, f2, f3, f4 = st.columns([1.2, 1.4, 1, 1], gap="medium")
+        tabla = f1.selectbox("Tabla de logs", tablas, key="tr_tabla",
+                             index=tablas.index("LOGS_2026_10") if "LOGS_2026_10" in tablas else 0)
+        sem = semanas_de(tabla)
+        semana = f2.selectbox("Semana", list(sem["WEEK"]), key="tr_semana",
+                              format_func=lambda w: f"Semana {w + 1} · {sem.loc[w, 'WEEK_START']:%d/%m} – "
+                                                    f"{sem.loc[w, 'WEEK_END']:%d/%m}")
+        size_s = f3.selectbox("Intervalo", list(wf.SIZES), index=3, key="tr_size",
+                              format_func=ventanas_mod.size_label)
+        stream = f4.selectbox("Origen", list(STREAMS), format_func=STREAMS.get, key="tr_stream")
+        correr = st.button("Iniciar entrenamiento", icon=":material/play_arrow:", type="primary",
+                           key="tr_correr")
+        st.caption("Intervalos cortos generan más ventanas y tardan más: 1 h suele terminar en menos de un minuto; "
+                   "5 min puede tardar varios minutos.")
+
+    c1, c2 = st.columns([1, 1.25], gap="medium")
+    with c1, tarjeta("Progreso", "Cada paso se marca al terminar, con su duración."):
+        ui = {"prog": st.empty(), "pasos": st.empty()}
+    with c2, tarjeta("Bitácora", "Mensajes del proceso en tiempo real."):
+        ui["log"] = st.empty()
+
+    if correr:
+        res = _correr_entrenamiento(tabla, int(semana), int(size_s), stream, ui)
+        if res:
+            st.session_state["tr_resultado"] = res
+    res = st.session_state.get("tr_resultado")
+    if res and not correr:
+        ui["prog"].progress(1.0, text=f"Última corrida: {res['tabla']} · semana {res['semana'] + 1} · "
+                                      f"{ventanas_mod.size_label(res['size_s'])} · {STREAMS[res['stream']]}")
+        ui["pasos"].html(_html_pasos(["ok"] * len(PASOS), res["durs"]))
+        ui["log"].code("\n".join(res["log"][-18:]), language=None, wrap_lines=True)
+    elif not correr:
+        ui["prog"].progress(0.0, text="Listo para iniciar")
+        ui["pasos"].html(_html_pasos(["pendiente"] * len(PASOS), [None] * len(PASOS)))
+        ui["log"].code("Elige la configuración y presiona Iniciar entrenamiento.", language=None, wrap_lines=True)
+    if res:
+        _resultado_entrenamiento(res)
+
+
+def pagina_mlops():
+    encabezado("MLOps", "Operación del modelo",
+               "Estado del sistema en producción y entrenamiento del modelo en tiempo real.",
+               pills=[("Modelo", "Isolation Forest (PAL)"), ("Contaminación", f"{CONTAMINATION_IF:.0%}"),
+                      ("Árboles", IF_N_ESTIMATORS)], con_periodo=False)
+    vista = st.segmented_control("Vista", ["Health checks", "Entrenamiento en vivo"], default="Health checks",
+                                 key="mlops_vista", label_visibility="collapsed") or "Health checks"
+    if vista == "Health checks":
+        _vista_health()
+    else:
+        _vista_entrenamiento()
+
+
 # Navegación
 pg_resumen = st.Page(pagina_resumen, title="Resumen", icon=":material/dashboard:",
                      url_path="resumen", default=True)
@@ -1226,5 +1934,7 @@ pg_postmortems = st.Page(pagina_postmortems, title="Postmortems SOC", icon=":mat
 pg_modelo = st.Page(pagina_modelo, title="Metodología", icon=":material/model_training:",
                     url_path="metodologia")
 
-pg = st.navigation([pg_resumen, pg_eventos, pg_tipos, pg_postmortems, pg_modelo], position="top")
+pg_mlops = st.Page(pagina_mlops, title="MLOps", icon=":material/monitor_heart:", url_path="mlops")
+
+pg = st.navigation([pg_resumen, pg_eventos, pg_tipos, pg_postmortems, pg_modelo, pg_mlops], position="top")
 pg.run()
