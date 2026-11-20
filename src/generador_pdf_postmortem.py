@@ -377,6 +377,15 @@ def generar_pdf_postmortem(postmortem_data: Dict[str, Any], output_path: Any):
     doc.build(story, canvasmaker=NumberedCanvas)
 
 
+def _clasificar_severidad_incidente(z_max: float, severidad_score: float = 0.0):
+    """Clasifica cualitativamente la severidad del incidente con color corporativo para tablas PDF."""
+    if z_max >= 20.0 or severidad_score >= 0.82:
+        return "Crítico", "#B42318", colors.HexColor("#FEE4E2")
+    if z_max >= 10.0 or severidad_score >= 0.74:
+        return "Grave", "#B54708", colors.HexColor("#FEF3C7")
+    return "Moderado", "#0057D2", colors.HexColor("#E0F2FE")
+
+
 def _extraer_causa_raiz_breve(reporte_md: str) -> str:
     """Extrae una sintesis concisa de Causa Raiz (Seccion 4) de un reporte Markdown."""
     if not reporte_md or "## 4." not in reporte_md:
@@ -576,38 +585,20 @@ def generar_pdf_postmortem_mensual(postmortems: List[Dict[str, Any]], periodo: s
         Paragraph("Origen", st['cell_bold']),
         Paragraph("Vector / Ataque", st['cell_bold']),
         Paragraph("Ventana Temporal (UTC)", st['cell_bold']),
-        Paragraph("Escalas", st['cell_bold']),
-        Paragraph("Indicador (Z)", st['cell_bold']),
-        Paragraph("Alcance", st['cell_bold']),
     ]]
     for p in ordenados:
-        meta_p = p.get('metadata_json') or {}
-        inc_p = meta_p.get('incident_meta') or {}
-        esc_p = (
-            meta_p.get('escalas_detectadas')
-            or inc_p.get('escalas_detectadas')
-            or ([str(inc_p['window_label'])] if inc_p.get('window_label') else ['5min'])
-        )
-        esc_txt = ", ".join(str(x) for x in esc_p)
         ini_s = str(p.get('inicio', 'N/A'))[:16]
         fin_s = str(p.get('fin', 'N/A'))
         fin_short = fin_s[11:16] if len(fin_s) >= 16 and fin_s[:10] == ini_s[:10] else fin_s[:16]
         ventana_str = f"{ini_s} -> {fin_short}"
-        z_f = str(inc_p.get('z_max_feature') or 'N/A')
-        z_v = float(inc_p.get('z_max') or 0.0)
-        n_a = len(p.get('aplicaciones_afectadas') or [])
-        n_i = len(p.get('ips_involucradas') or [])
         matriz_rows.append([
             Paragraph(f"<b>{_md_to_reportlab(str(p.get('postmortem_id', 'N/A')))}</b>", st['cell']),
             Paragraph(_md_to_reportlab(str(p.get('stream', '')).upper()), st['cell']),
             Paragraph(_md_to_reportlab(str(p.get('tipo_ataque', 'N/A'))), st['cell']),
             Paragraph(_md_to_reportlab(ventana_str), st['cell']),
-            Paragraph(_md_to_reportlab(esc_txt), st['cell']),
-            Paragraph(_md_to_reportlab(f"{z_f} ({z_v:.1f})"), st['cell']),
-            Paragraph(_md_to_reportlab(f"{n_a} apps / {n_i} IPs"), st['cell']),
         ])
 
-    t_mat = Table(matriz_rows, colWidths=[116, 44, 78, 96, 62, 92, 52], repeatRows=1)
+    t_mat = Table(matriz_rows, colWidths=[145, 70, 155, 170], repeatRows=1)
     t_mat.setStyle(TableStyle([
         ('BACKGROUND', (0, 0), (-1, 0), SAP_LIGHT),
         ('BOX', (0, 0), (-1, -1), 0.5, SAP_BORDER),
@@ -630,6 +621,13 @@ def generar_pdf_postmortem_mensual(postmortems: List[Dict[str, Any]], periodo: s
         st['body'],
     ))
     story.append(Spacer(1, 4))
+
+    cell_center_bold = ParagraphStyle(
+        'TableCellCenterBold', parent=st['cell_bold'], alignment=1,
+    )
+    cell_center = ParagraphStyle(
+        'TableCellCenter', parent=st['cell'], alignment=1,
+    )
 
     for idx_c, (vec, lista) in enumerate(campanas_ordenadas, start=1):
         st_vec = ", ".join(sorted({str(x.get('stream', '')).upper() for x in lista}))
@@ -702,16 +700,25 @@ def generar_pdf_postmortem_mensual(postmortems: List[Dict[str, Any]], periodo: s
         # Tabla compacta con el desglose de cada incidente dentro de esta campana
         inc_rows = [[
             Paragraph("Expediente y Ventana (UTC)", st['cell_bold']),
-            Paragraph("Escalas / Z-Max", st['cell_bold']),
+            Paragraph("Severidad", cell_center_bold),
             Paragraph("Hallazgo Forense Puntual (Sintesis Gemini)", st['cell_bold']),
         ]]
-        for x in lista:
+        inc_table_styles = [
+            ('BACKGROUND', (0, 0), (-1, 0), colors.HexColor('#F0F7FF')),
+            ('BOX', (0, 0), (-1, -1), 0.5, SAP_BORDER),
+            ('INNERGRID', (0, 0), (-1, -1), 0.5, SAP_BORDER),
+            ('VALIGN', (0, 0), (-1, -1), 'TOP'),
+            ('VALIGN', (1, 1), (1, -1), 'MIDDLE'),
+            ('TOPPADDING', (0, 0), (-1, -1), 2.2),
+            ('BOTTOMPADDING', (0, 0), (-1, -1), 2.2),
+        ]
+        for row_idx, x in enumerate(lista, start=1):
             mx = x.get('metadata_json') or {}
             incx = mx.get('incident_meta') or {}
-            esc_x = ", ".join(str(e) for e in (mx.get('escalas_detectadas') or incx.get('escalas_detectadas') or ['5min']))
-            zf_x = str(incx.get('z_max_feature') or 'N/A')
             zv_x = float(incx.get('z_max') or 0.0)
-            nw_x = int(incx.get('n_ventanas') or 1)
+            sev_s = float(x.get('severidad_score') or 0.0)
+            sev_lbl, sev_fg, sev_bg = _clasificar_severidad_incidente(zv_x, sev_s)
+            inc_table_styles.append(('BACKGROUND', (1, row_idx), (1, row_idx), sev_bg))
             ini_x = str(x.get('inicio', 'N/A'))[:16]
             fin_x = str(x.get('fin', 'N/A'))[:16]
             res_x = str(x.get('resumen_ejecutivo') or '').strip()
@@ -725,21 +732,13 @@ def generar_pdf_postmortem_mensual(postmortems: List[Dict[str, Any]], periodo: s
                     st['cell'],
                 ),
                 Paragraph(
-                    f"<b>{_md_to_reportlab(esc_x)}</b> ({nw_x} bloq.)<br/>"
-                    f"{_md_to_reportlab(zf_x)} (Z={zv_x:.1f})",
-                    st['cell'],
+                    f"<b><font color='{sev_fg}'>{sev_lbl}</font></b>",
+                    cell_center,
                 ),
                 Paragraph(_md_to_reportlab(res_x), st['cell']),
             ])
-        t_inc_camp = Table(inc_rows, colWidths=[122, 110, 308], repeatRows=1)
-        t_inc_camp.setStyle(TableStyle([
-            ('BACKGROUND', (0, 0), (-1, 0), colors.HexColor('#F0F7FF')),
-            ('BOX', (0, 0), (-1, -1), 0.5, SAP_BORDER),
-            ('INNERGRID', (0, 0), (-1, -1), 0.5, SAP_BORDER),
-            ('VALIGN', (0, 0), (-1, -1), 'TOP'),
-            ('TOPPADDING', (0, 0), (-1, -1), 2.2),
-            ('BOTTOMPADDING', (0, 0), (-1, -1), 2.2),
-        ]))
+        t_inc_camp = Table(inc_rows, colWidths=[126, 72, 342], repeatRows=1)
+        t_inc_camp.setStyle(TableStyle(inc_table_styles))
         story.append(t_inc_camp)
 
         # Muestra representativa de logs crudos MCP para la campana (maximo 3 lineas consolidadas)

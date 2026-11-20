@@ -13,7 +13,6 @@ src/cf_deployment/
 src/cron_job_worker.py
 src/agente_forense_postmortem.py
 src/probar_agente_postmortem.py
-src/workflow.py
 subir_hana.py
 runtime.txt
 /requirements.txt
