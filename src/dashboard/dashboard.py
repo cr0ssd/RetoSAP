@@ -28,6 +28,7 @@ from generador_pdf_postmortem import (
     _clasificar_severidad_incidente,
 )
 from helpers.conexion import _params
+from helpers.email_sender import EmailSendError, enviar_postmortem_pdf, estado_servicio_correo
 from helpers.explicacion import FAMILIAS_SYSTEM, FAMILIAS_LLM, zscores, perfil_familias
 from helpers.clasificacion import FIRMAS, TIPOS_NO_ATAQUE, clasificar_eventos, validar_firmas
 from helpers import ventanas as ventanas_mod
@@ -1103,16 +1104,17 @@ def pagina_postmortems():
     pm_f = pm_f.sort_values(["INICIO", "EVENTO_ID"], ascending=[True, True]) \
         .reset_index(drop=True)
 
-    # Cabecera con botones globales de descarga del reporte mensual consolidado
+    # Cabecera con botones globales de descarga y envio por correo del reporte mensual consolidado
+    pdf_mes = None
     with header_slot:
-        h_left, h_right = st.columns([1.75, 1.25], vertical_alignment="bottom", gap="medium")
+        h_left, h_right = st.columns([1.45, 1.55], vertical_alignment="bottom", gap="medium")
         with h_left:
             encabezado("Postmortems SOC", titulo_pm(periodo),
                        "Resumen consolidado de todos los incidentes investigados del mes y "
                        "exportación ejecutiva multipágina.",
                        pills=[("Periodo", periodo), ("Incidentes", len(pm_f))])
         with h_right:
-            b1, b2 = st.columns(2, gap="small")
+            b1, b2, b3 = st.columns(3, gap="small")
             with b1:
                 try:
                     pdf_mes = _construir_pdf_mensual_bytes(pm_f, periodo)
@@ -1139,6 +1141,97 @@ def pagina_postmortems():
                     width="stretch",
                     help="Descarga el consolidado completo del mes en Markdown.",
                 )
+            with b3:
+                if st.button(
+                    "Enviar por correo",
+                    icon=":material/mail:",
+                    width="stretch",
+                    key="btn_toggle_pm_email",
+                    help="Abre el formulario para enviar este reporte PDF por correo electrónico.",
+                ):
+                    st.session_state["pm_show_email"] = not st.session_state.get("pm_show_email", False)
+
+        if st.session_state.get("pm_show_email", False):
+            estado_mail = estado_servicio_correo()
+            pdf_filename = f"Postmortem_SOC_{MES}.pdf"
+            periodo_correo = f"{periodo} ({TXT_PERIODO})" if PERIODO else periodo
+            n_tacticas_mail = int(pm_f["MITRE_TACTIC"].dropna().astype(str).nunique())
+            apps_mail = sorted({a for v in pm_f["APLICACIONES_AFECTADAS"] for a in _parse_lista_campo(v)})
+            size_kb = (len(pdf_mes) / 1024.0) if pdf_mes else 0.0
+
+            with tarjeta(
+                "Enviar reporte PDF por correo electrónico",
+                f"Adjunto listo: {pdf_filename} ({size_kb:.1f} KB · {len(pm_f)} incidente(s)) · "
+                f"Proveedor: {estado_mail['provider_label']}.",
+            ):
+                if not estado_mail["configured"]:
+                    st.warning(estado_mail["hint"])
+                elif estado_mail.get("sandbox"):
+                    st.info(estado_mail["hint"])
+
+                with st.form("form_enviar_pm_correo", clear_on_submit=False):
+                    c_to, c_subj = st.columns([1.15, 1.0], gap="medium")
+                    destinatario = c_to.text_input(
+                        "Correo(s) destinatario(s)",
+                        placeholder="analista@sap.com, soc@empresa.com",
+                        help="Puedes ingresar uno o varios correos separados por coma.",
+                        key="pm_email_to",
+                    )
+                    asunto_mail = c_subj.text_input(
+                        "Asunto",
+                        value=f"Reporte Forense Postmortem SOC — {periodo_correo} ({len(pm_f)} incidentes)",
+                        key=f"pm_email_subject_{MES}_{len(pm_f)}_{bool(PERIODO)}",
+                    )
+                    nota_mail = st.text_area(
+                        "Mensaje adicional (opcional)",
+                        placeholder="Ej. Compartimos el dossier forense mensual revisado para la sesión SOC.",
+                        height=68,
+                        key="pm_email_note",
+                    )
+                    act_1, act_2, _ = st.columns([1.0, 0.75, 2.25], gap="small")
+                    enviar_click = act_1.form_submit_button(
+                        "Enviar PDF",
+                        icon=":material/send:",
+                        type="primary",
+                        width="stretch",
+                        disabled=(pdf_mes is None),
+                    )
+                    cerrar_click = act_2.form_submit_button(
+                        "Cerrar",
+                        width="stretch",
+                    )
+
+                if cerrar_click:
+                    st.session_state["pm_show_email"] = False
+                    st.rerun()
+
+                if enviar_click:
+                    if not pdf_mes:
+                        st.error("No hay un PDF generado para adjuntar.")
+                    else:
+                        with st.spinner("Enviando reporte PDF por correo..."):
+                            try:
+                                res_mail = enviar_postmortem_pdf(
+                                    destinatarios_raw=destinatario,
+                                    pdf_bytes=pdf_mes,
+                                    filename=pdf_filename,
+                                    periodo=periodo_correo,
+                                    n_incidentes=len(pm_f),
+                                    n_tacticas=n_tacticas_mail,
+                                    n_apps=len(apps_mail),
+                                    asunto=asunto_mail,
+                                    nota_adicional=nota_mail,
+                                )
+                                recips = ", ".join(res_mail["recipients"])
+                                msg_id = f" (ID: {res_mail['message_id']})" if res_mail.get("message_id") else ""
+                                st.success(
+                                    f"Reporte {pdf_filename} enviado correctamente a {recips} "
+                                    f"vía {res_mail['provider']}{msg_id}."
+                                )
+                            except EmailSendError as err:
+                                st.error(str(err))
+                            except Exception as err:
+                                st.error(f"Error inesperado al enviar correo: {err}")
 
     # KPIs del periodo (sin severidad)
     n_tacticas = int(pm_f["MITRE_TACTIC"].dropna().astype(str).nunique())
