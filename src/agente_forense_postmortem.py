@@ -30,6 +30,8 @@ for p in (REPO_ROOT, SRC_DIR):
     if p not in sys.path:
         sys.path.insert(0, p)
 
+from helpers.idioma import CONFIANZA_EN, tipo_en, traducir_reporte_en
+
 try:
     from mcp_hana_tools import HanaMcpTools
     from generador_pdf_postmortem import generar_pdf_postmortem
@@ -82,6 +84,10 @@ def _extraer_resumen_de_markdown(reporte_md: str, fallback: str) -> str:
             limpio = limpio.split(":", 1)[-1].strip() if ":" in limpio else limpio[len("resumen ejecutivo"):].lstrip(" .-")
         if limpio.lower().startswith("y clasificacion de la amenaza"):
             limpio = limpio[len("y clasificacion de la amenaza"):].lstrip(" .:-")
+        for pref in ("executive summary and threat classification", "executive summary"):
+            if limpio.lower().startswith(pref):
+                limpio = limpio[len(pref):].lstrip(" .:-")
+                break
         if len(limpio) >= 45:
             parrafos.append(limpio)
     if parrafos:
@@ -175,6 +181,7 @@ class AgenteForensePostmortem:
 
         # Paso 4: Redactar reporte (Gemini API o Motor de Respaldo)
         postmortem_id = construir_postmortem_id(mes, incident_data)
+        self._generador = 'deterministico'
 
         if self.llm_client and self.llm_client[0] == 'gemini':
             reporte_md = self._sintetizar_con_gemini(
@@ -203,6 +210,24 @@ class AgenteForensePostmortem:
         )
         resumen_ejecutivo = _extraer_resumen_de_markdown(reporte_md, resumen_base)
 
+        # Paso 4b: Version en ingles (misma informacion). Con Gemini se traduce el reporte redactado;
+        # sin Gemini (o si la traduccion falla) se usa la plantilla deterministica en ingles.
+        reporte_md_en = None
+        if self._generador == 'gemini_api':
+            reporte_md_en = traducir_reporte_en(self.llm_client[1], reporte_md)
+        if not reporte_md_en:
+            reporte_md_en = self._sintetizar_postmortem_deterministico_en(
+                postmortem_id, incident_data, telemetry, raw_evidence, mitre_info)
+        resumen_base_en = (
+            f"Incident {postmortem_id}: '{tipo_en(tipo_ataque)}' activity classified under "
+            f"{mitre_info['technique']} was detected at the {', '.join(escalas)} scales. "
+            f"It involved {len(raw_evidence['aplicaciones_afectadas'])} SAP application(s) and "
+            f"{len(raw_evidence['ips_involucradas'])} IP address(es) across "
+            f"{incident_data['n_ventanas']} anomalous window(s), with the largest deviation in "
+            f"{incident_data.get('z_max_feature', 'N/A')} (Z = {float(incident_data.get('z_max') or 0.0):.2f})."
+        )
+        resumen_ejecutivo_en = _extraer_resumen_de_markdown(reporte_md_en, resumen_base_en)
+
         resultado = {
             'postmortem_id': postmortem_id,
             'evento_id': evento_id,
@@ -217,6 +242,8 @@ class AgenteForensePostmortem:
             'ips_involucradas': raw_evidence['ips_involucradas'],
             'resumen_ejecutivo': resumen_ejecutivo,
             'reporte_markdown': reporte_md,
+            'resumen_ejecutivo_en': resumen_ejecutivo_en,
+            'reporte_markdown_en': reporte_md_en,
             'metadata_json': {
                 'incident_meta': {
                     **incident_data,
@@ -227,7 +254,7 @@ class AgenteForensePostmortem:
                 'escalas_detectadas': escalas,
                 'evidence_logs_sample': raw_evidence.get('logs_muestra', [])[:6],
                 'total_raw_evidence_sampled': raw_evidence['total_obtenidos'],
-                'generador': 'gemini_api' if (self.llm_client and self.llm_client[0] == 'gemini') else 'deterministico'
+                'generador': self._generador
             }
         }
 
@@ -329,6 +356,7 @@ class AgenteForensePostmortem:
                 )
                 if resp and resp.text:
                     log.info("[OK] Reporte postmortem redactado exitosamente por Gemini API (%s).", m_actual)
+                    self._generador = 'gemini_api'
                     return resp.text.strip()
                 raise RuntimeError("Respuesta vacia recibida de Gemini API.")
             except Exception as e:
@@ -337,6 +365,7 @@ class AgenteForensePostmortem:
                     log.info("[LLM] Reintentando con fallback %s...", modelos_intento[idx_m + 1])
 
         log.warning("[WARN] Recurriendo a motor deterministico de respaldo para %s.", postmortem_id)
+        self._generador = 'deterministico'
         return self._sintetizar_postmortem_deterministico(
             postmortem_id, incident_data, telemetry, raw_evidence, mitre_info
         )
@@ -477,3 +506,126 @@ El analisis estadistico correlacionado indica que el incidente se origino median
 ### Acciones a Mediano Plazo (Hardening de Arquitectura):
 1. **Revision de Logs de Auditoria:** Auditar cambios recientes en politicas de autorizacion y roles de BTP.
 2. **Monitoreo Continuo con Isolation Forest:** Mantener la calibracion semanal de umbrales para deteccion preventiva temprana."""
+
+    def _sintetizar_postmortem_deterministico_en(self, postmortem_id: str, incident_data: Dict[str, Any],
+                                                  telemetry: Dict[str, Any], raw_evidence: Dict[str, Any],
+                                                  mitre_info: Dict[str, Any]) -> str:
+        """English version of the deterministic fallback report (same structure and data)."""
+        stream = incident_data['stream']
+        tipo = tipo_en(incident_data['tipo_ataque'])
+        confianza = CONFIANZA_EN.get(str(incident_data.get('confianza', '')).lower(),
+                                     str(incident_data.get('confianza', 'N/A')))
+        escalas = ', '.join(incident_data.get('escalas_detectadas') or [str(incident_data.get('window_label', '5min'))])
+        apps = ", ".join(f"`{a}`" for a in raw_evidence['aplicaciones_afectadas']) if raw_evidence['aplicaciones_afectadas'] else "`sap-core-services`"
+        ips = ", ".join(f"`{ip}`" for ip in raw_evidence['ips_involucradas']) if raw_evidence['ips_involucradas'] else "No direct IP (internal/proxy call)"
+
+        evidencia = []
+        for item in raw_evidence.get('logs_muestra', [])[:6]:
+            ts = item.get('TIMESTAMP', 'N/A')
+            app = item.get('SAP_FUNCTION_APPLICATION', 'N/A')
+            if stream == 'llm':
+                prompt = item.get('LLM_PROMPT') or 'N/A'
+                evidencia.append(
+                    f"- **[{ts}] App:** `{app}` | **Status:** `{item.get('LLM_STATUS') or 'N/A'}`\n"
+                    f"  - **Prompt Extract:** `{prompt[:140]}...`\n"
+                    f"  - **Security Filter Output:** `{item.get('LLM_ERROR_MESSAGE') or 'None'}`")
+            else:
+                evidencia.append(
+                    f"- **[{ts}] IP:** `{item.get('CLIENT_IP', 'N/A')}` | **HTTP:** `{item.get('HTTP_STATUS_CODE', 'N/A')}` | "
+                    f"**Path:** `{item.get('HEATHERS_REQUEST_PATH', 'N/A')}`\n"
+                    f"  - **Log Message:** `{item.get('SAP_FUNCTION_MESSAGE', 'N/A')}`")
+        evidencia_bloque = "\n".join(evidencia) if evidencia else "No additional specific records were retrieved."
+        z_max = float(incident_data.get('z_max') or 0.0)
+
+        return f"""# FORENSIC POSTMORTEM REPORT: {postmortem_id}
+**Classification:** Confidential SOC Document / SAP Cloud Observability  
+**Issue Date:** {datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}  
+**Status:** Confirmed and Investigated
+
+---
+
+## 1. Executive Summary and Threat Classification
+
+- **Incident Identifier:** `{postmortem_id}` (Event ID `{incident_data['evento_id']}`)
+- **Telemetry Stream:** `{stream.upper()}`
+- **Classified Attack Vector:** `{tipo}` (Confidence: `{confianza.upper()}`)
+- **Detected Window Scales:** `{escalas}`
+- **Most Anomalous Variable (Z-Score):** `{incident_data['z_max_feature']}` (Z = `{z_max:.2f}`)
+- **MITRE ATT&CK Mapping:**
+  - **Tactic:** `{mitre_info['tactic']}`
+  - **Technique:** `{mitre_info['technique']}`
+
+### Event Summary:
+During the monitoring window, an anomalous deviation from the operational baseline was detected at the `{escalas}` scales. The Isolation Forest model isolated {incident_data['n_ventanas']} consecutive anomalous windows that reached a maximum z-score of {z_max:.2f} in the variable `{incident_data['z_max_feature']}`. The execution profile matches **{tipo}** patterns, affecting the services {apps}.
+
+---
+
+## 2. Chronological Timeline (Incident Timeline)
+
+| Milestone | Timestamp (UTC) | Operational Description |
+| :--- | :--- | :--- |
+| **T0 - Anomaly Start** | `{incident_data['inicio']}` | First Isolation Forest threshold trigger. |
+| **T1 - Peak Impact** | `{incident_data.get('ventana_pico', incident_data['inicio'])}` | Maximum Z-score ({z_max:.2f}) in `{incident_data['z_max_feature']}`. |
+| **T2 - End / Mitigation** | `{incident_data['fin']}` | End of the recorded consecutive anomalous window. |
+
+---
+
+## 3. Compromised SAP Systems, Services and Components
+
+- **Affected SAP Services:** {apps}
+- **IP Addresses / Sources:** {ips}
+- **Runtime Environment:** SAP BTP Cloud Foundry Runtime / SAP Cloud Services
+
+---
+
+## 4. Forensic Root Cause Analysis and Evidence (Root Cause)
+
+The correlated statistical analysis indicates that the incident originated from an anomalous dispersion classified as **{tipo}**. The aggregated telemetry shows a significant change in `{incident_data['z_max_feature']}`, reaching a deviation of {z_max:.2f} sigmas above the historical mean.
+
+### Log Evidence Sampled via MCP:
+{evidencia_bloque}
+
+---
+
+## 5. Mitigation Plan and Hardening Recommendations (Action Items)
+
+{self._generar_hardening_recomendaciones_en(incident_data['tipo_ataque'])}
+
+---
+*Report automatically generated by the SAP Observability Forensic Agent. Data verified against master tables in SAP HANA Cloud.*
+"""
+
+    def _generar_hardening_recomendaciones_en(self, tipo_ataque: str) -> str:
+        """English version of the corrective actions by attack vector."""
+        if 'Prompt injection' in tipo_ataque:
+            return """### Immediate Actions (Containment):
+1. **Blocking Rule at the Inference Gateway:** Implement input inspection in the AI proxy before dispatching requests to foundation models.
+2. **Enable Security Guardrails:** Deploy strict policies in Llama Guard / NeMo Guardrails to intercept context-evasion directives (`SYSTEM:`, `ignore previous instructions`, etc.).
+
+### Medium-Term Actions (Architecture Hardening):
+1. **Strict Context Separation:** Isolate system instructions from untrusted user data using structured XML delimiters.
+2. **Tool Calling Permission Review:** Revoke elevated execution privileges for functions that expose salary data, credentials or database schemas."""
+        elif 'Degradación del servicio' in tipo_ataque or 'DoS' in tipo_ataque or 'DDoS' in tipo_ataque:
+            return """### Immediate Actions (Containment):
+1. **Gateway Timeout Tuning:** Lower the inference and HTTP request timeout from 30s to 15s to release blocked threads.
+2. **Active Circuit Breakers:** Enable per-application circuit breakers so that an external service failure does not exhaust the BTP connection pool.
+
+### Medium-Term Actions (Architecture Hardening):
+1. **Dynamic Rate Limiting:** Configure per-minute request quotas based on token buckets at both the IP and `SERVICE_ID` level.
+2. **Adaptive Provider Routing:** Balance load across multiple instances or providers to avoid quota saturation (HTTP 429)."""
+        elif 'Fuerza bruta' in tipo_ataque:
+            return """### Immediate Actions (Containment):
+1. **Immediate WAF Blocking:** Create IP blocking rules for sources with high rates of consecutive 401/403 failures.
+2. **Account Lockout / Login Rate Limit:** Enforce temporary lockout policies after 5 consecutive failed authentication attempts.
+
+### Medium-Term Actions (Architecture Hardening):
+1. **Mandatory MFA (Multi-Factor Authentication):** Enforce MFA for all users with administrative roles or access to finance APIs.
+2. **Continuous IP Entropy Monitoring:** Alert the SOC in real time when the request entropy of a single subnet exceeds 3 standard deviations."""
+        else:
+            return """### Immediate Actions (Containment):
+1. **Preventive Isolation:** Validate the integrity of the affected endpoints and restrict unauthenticated access.
+2. **Header Inspection:** Block unusual HTTP methods and validate the Content-Type of incoming requests.
+
+### Medium-Term Actions (Architecture Hardening):
+1. **Audit Log Review:** Audit recent changes to BTP authorization policies and roles.
+2. **Continuous Monitoring with Isolation Forest:** Keep the weekly threshold calibration for early preventive detection."""

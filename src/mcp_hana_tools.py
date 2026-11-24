@@ -30,6 +30,21 @@ from helpers.clasificacion import TIPOS_NO_ATAQUE
 log = logging.getLogger('mcp_hana_tools')
 
 
+
+# Columnas de la versión en inglés del reporte (se agregan a tablas creadas antes de existir).
+COLUMNAS_EN = {"RESUMEN_EJECUTIVO_EN": "NVARCHAR(3000)", "REPORTE_MARKDOWN_EN": "NCLOB"}
+
+
+def asegurar_columnas_en(cur, tabla_pm):
+    """Agrega RESUMEN_EJECUTIVO_EN y REPORTE_MARKDOWN_EN a la tabla si todavía no las tiene."""
+    cur.execute("SELECT COLUMN_NAME FROM SYS.TABLE_COLUMNS WHERE SCHEMA_NAME = CURRENT_SCHEMA "
+                f"AND TABLE_NAME = '{tabla_pm}'")
+    existentes = {r[0] for r in cur.fetchall()}
+    for col, tipo in COLUMNAS_EN.items():
+        if col not in existentes:
+            cur.execute(f'ALTER TABLE "{tabla_pm}" ADD ("{col}" {tipo})')
+            log.info("[DB] Columna %s agregada a %s", col, tabla_pm)
+
 class HanaMcpTools:
     """
     Capa de herramientas MCP conectada a SAP HANA Cloud.
@@ -334,6 +349,8 @@ class HanaMcpTools:
             "IPS_INVOLUCRADAS" NVARCHAR(2000),
             "RESUMEN_EJECUTIVO" NVARCHAR(3000),
             "REPORTE_MARKDOWN" NCLOB,
+            "RESUMEN_EJECUTIVO_EN" NVARCHAR(3000),
+            "REPORTE_MARKDOWN_EN" NCLOB,
             "METADATA_JSON" NCLOB,
             "FECHA_GENERACION" TIMESTAMP DEFAULT CURRENT_UTCTIMESTAMP,
             PRIMARY KEY ("POSTMORTEM_ID")
@@ -352,6 +369,8 @@ class HanaMcpTools:
                     self.conn.connection.commit()
                 except Exception:
                     pass
+                asegurar_columnas_en(cur, tabla_pm)
+                self.conn.connection.commit()
             cur.close()
         except Exception as e:
             log.warning("[WARN] Verificacion DDL de %s: %s", tabla_pm, e)
@@ -370,16 +389,19 @@ class HanaMcpTools:
         ips = ", ".join(postmortem_dict.get('ips_involucradas', []))[:1990]
         resumen = str(postmortem_dict.get('resumen_ejecutivo', ''))[:2990]
         reporte_md = str(postmortem_dict.get('reporte_markdown', ''))
+        resumen_en = str(postmortem_dict.get('resumen_ejecutivo_en') or '')[:2990] or None
+        reporte_md_en = str(postmortem_dict.get('reporte_markdown_en') or '') or None
         metadata_str = json.dumps(postmortem_dict.get('metadata_json', {}), ensure_ascii=False)
 
         upsert_sql = f"""
         UPSERT "{tabla_pm}" (
             "POSTMORTEM_ID", "EVENTO_ID", "STREAM", "SOURCE_TABLE", "TIPO_ATAQUE",
             "MITRE_TACTIC", "SEVERIDAD_SCORE", "INICIO", "FIN", "APLICACIONES_AFECTADAS",
-            "IPS_INVOLUCRADAS", "RESUMEN_EJECUTIVO", "REPORTE_MARKDOWN", "METADATA_JSON",
+            "IPS_INVOLUCRADAS", "RESUMEN_EJECUTIVO", "REPORTE_MARKDOWN",
+            "RESUMEN_EJECUTIVO_EN", "REPORTE_MARKDOWN_EN", "METADATA_JSON",
             "FECHA_GENERACION"
         ) VALUES (
-            ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_UTCTIMESTAMP
+            ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_UTCTIMESTAMP
         ) WITH PRIMARY KEY
         """
 
@@ -388,7 +410,7 @@ class HanaMcpTools:
             cur.execute(upsert_sql, (
                 pm_id, evento_id, stream, source_table, tipo_ataque,
                 mitre_tactic, severidad, inicio, fin, apps,
-                ips, resumen, reporte_md, metadata_str
+                ips, resumen, reporte_md, resumen_en, reporte_md_en, metadata_str
             ))
             self.conn.connection.commit()
             cur.close()
