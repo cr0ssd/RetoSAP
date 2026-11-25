@@ -1,15 +1,19 @@
 """MLOps · Health checks del sistema (infraestructura, datos, modelo y agente forense)."""
 import html
+import json
 import os
 import time
+import urllib.error
+import urllib.request
 
 import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
 
-from datos_hana import _conn, leer, leer_postmortems, _parse_json_safe
+from datos_hana import _conn, reiniciar_conexion, leer, leer_postmortems, _parse_json_safe
 from helpers.clasificacion import validar_firmas
+from helpers.email_sender import estado_servicio_correo
 from helpers.IsolationForest import CONTAMINATION as CONTAMINATION_IF
 from tema import BRAND, CRITICO, INK2, MUTED, NEUTRO, SERIES, STREAMS
 import workflow as wf   # configuración y pasos del pipeline de producción
@@ -80,10 +84,62 @@ def hc_conexion():
     return tr("Conexión a SAP HANA Cloud", "SAP HANA Cloud connection")
 
 
+def _es_hana_apagada(err_text):
+    """Detecta si el error de SAP HANA corresponde a una instancia detenida (codigo 1890)."""
+    low = str(err_text or "").lower()
+    return "1890" in low or "stopped" in low or "inactive" in low
+
+
+def _check_chatbot():
+    """Verifica el endpoint /health del backend Node.js de Sapy."""
+    chat_url = os.getenv("CHATBOT_URL", "http://localhost:3000/api/chat")
+    health_url = (
+        chat_url.rsplit("/api/chat", 1)[0] + "/health"
+        if "/api/chat" in chat_url
+        else chat_url.rstrip("/") + "/health"
+    )
+    t = time.perf_counter()
+    try:
+        with urllib.request.urlopen(health_url, timeout=3) as resp:
+            payload = json.loads(resp.read().decode("utf-8") or "{}")
+        ms = (time.perf_counter() - t) * 1000
+        if payload.get("ok") is True:
+            model = str(payload.get("model") or os.getenv("GEMINI_MODEL", "gemini-3.5-flash-lite"))
+            return (
+                "ok",
+                f"{ms:.0f} ms",
+                tr(f"Servidor Node de Sapy activo (modelo {model}).", f"Sapy Node server active (model {model})."),
+            )
+        return (
+            "warn",
+            tr("Respuesta inesperada", "Unexpected reply"),
+            tr(f"El endpoint {health_url} respondió sin confirmación.", f"Endpoint {health_url} replied without ok=true."),
+        )
+    except Exception:
+        return (
+            "warn",
+            tr("Sin respuesta", "Unreachable"),
+            tr(f"El servidor de Sapy no responde en {health_url}.", f"Sapy server is not responding at {health_url}."),
+        )
+
+
+def _check_email_service():
+    """Verifica si el proveedor transaccional de correo (Resend/Brevo/SMTP) esta listo."""
+    est = estado_servicio_correo()
+    if est["configured"] and not est.get("sandbox"):
+        return ("ok", est["provider_label"], est["hint"])
+    if est["configured"] and est.get("sandbox"):
+        return ("warn", f"{est['provider_label']} (sandbox)", est["hint"])
+    return ("warn", tr("No configurado", "Not configured"), est["hint"])
+
+
 def health_checks():
     """Lista de verificaciones: (grupo, nombre, estado, valor, detalle)."""
     hc = []
-    # Infraestructura
+    hana_ok = True
+    hana_err = None
+
+    # Infraestructura: SAP HANA + servicios externos/locales del entorno
     try:
         ms = _ping_hana()
         hc.append((tr("Infraestructura", "Infrastructure"), hc_conexion(),
@@ -91,21 +147,78 @@ def health_checks():
                    tr("Tiempo de respuesta de una consulta mínima (SELECT 1 FROM DUMMY).",
                       "Response time of a minimal query (SELECT 1 FROM DUMMY).")))
     except Exception as e:
-        hc.append((tr("Infraestructura", "Infrastructure"), hc_conexion(), "fail", tr("Sin conexión", "No connection"), str(e)[:160]))
-        return hc
-    hc.append((tr("Infraestructura", "Infrastructure"), tr("Versión de SAP HANA", "SAP HANA version"), "info", version_hana(),
-               tr("Motor donde corren las ventanas, Isolation Forest y K-means (PAL).",
-                  "Engine running the windows, Isolation Forest and K-means (PAL).")))
+        hana_ok = False
+        hana_err = str(e)
+        if _es_hana_apagada(hana_err):
+            hc.append((
+                tr("Infraestructura", "Infrastructure"),
+                hc_conexion(),
+                "fail",
+                tr("Instancia apagada", "Instance stopped"),
+                tr(
+                    "La instancia de SAP HANA Cloud está apagada (código 1890). Enciéndela desde SAP HANA Cloud Central y presiona Volver a revisar.",
+                    "The SAP HANA Cloud instance is stopped (code 1890). Start it from SAP HANA Cloud Central and click Check again.",
+                ),
+            ))
+        else:
+            hc.append((tr("Infraestructura", "Infrastructure"), hc_conexion(), "fail",
+                       tr("Sin conexión", "No connection"), hana_err[:180]))
+
+    if hana_ok:
+        hc.append((tr("Infraestructura", "Infrastructure"), tr("Versión de SAP HANA", "SAP HANA version"), "info", version_hana(),
+                   tr("Motor donde corren las ventanas, Isolation Forest y K-means (PAL).",
+                      "Engine running the windows, Isolation Forest and K-means (PAL).")))
+
+    cb_status, cb_val, cb_det = _check_chatbot()
+    hc.append((tr("Infraestructura", "Infrastructure"), tr("Asistente Sapy (Chatbot)", "Sapy Assistant (Chatbot)"),
+               cb_status, cb_val, cb_det))
+
+    em_status, em_val, em_det = _check_email_service()
+    hc.append((tr("Infraestructura", "Infrastructure"), tr("Servicio de correo (Postmortems PDF)", "Email service (Postmortem PDFs)"),
+               em_status, em_val, em_det))
+
     gemini = bool(os.getenv("GEMINI_API_KEY"))
     hc.append((tr("Infraestructura", "Infrastructure"), tr("Credencial de Gemini en este entorno", "Gemini credential in this environment"),
                "ok" if gemini else "info",
                tr("Configurada", "Configured") if gemini else tr("No configurada", "Not configured"),
-               tr("Este entorno puede generar reportes con Gemini.", "This environment can generate reports with Gemini.")
+               tr("Este entorno puede generar reportes y operar Sapy con Gemini.", "This environment can generate reports and run Sapy with Gemini.")
                if gemini else
-               tr("El dashboard no la necesita: el worker de Cloud Foundry usa su propia llave "
-                  "(ver Redacción con Gemini).",
-                  "The dashboard does not need it: the Cloud Foundry worker uses its own key "
-                  "(see Written with Gemini).")))
+               tr("El dashboard no la necesita para leer datos; el backend de Sapy y los reportes con Gemini sí la requieren.",
+                  "The dashboard does not need it to read data; the Sapy backend and Gemini reports require it.")))
+
+    # Modelo (verificacion en Python, independiente de HANA)
+    try:
+        for stx in STREAMS:
+            validar_firmas(wf.FEATURES[stx], firmas=wf.FIRMAS[stx])
+        hc.append((tr("Modelo", "Model"), tr("Firmas de clasificación", "Classification signatures"), "ok", "24 + 18 variables",
+                   tr("Cada variable del Isolation Forest tiene firma y no sobran firmas.",
+                      "Every Isolation Forest variable has a signature and there are no extra signatures.")))
+    except Exception as e:
+        hc.append((tr("Modelo", "Model"), tr("Firmas de clasificación", "Classification signatures"), "fail",
+                   tr("Inconsistentes", "Inconsistent"), str(e)[:160]))
+
+    if not hana_ok:
+        hc.append((
+            tr("Datos", "Data"),
+            tr("Cobertura e integridad en HANA", "Coverage and integrity in HANA"),
+            "warn",
+            tr("En espera de HANA", "Waiting for HANA"),
+            tr(
+                "No se pueden consultar tablas LOGS_* ni RESULT_* mientras SAP HANA Cloud esté apagada o sin conexión.",
+                "Cannot query LOGS_* or RESULT_* tables while SAP HANA Cloud is stopped or unreachable.",
+            ),
+        ))
+        hc.append((
+            tr("Agente forense", "Forensic agent"),
+            tr("Reportes postmortem en HANA", "Postmortem reports in HANA"),
+            "warn",
+            tr("En espera de HANA", "Waiting for HANA"),
+            tr(
+                "Las métricas de RESULT_POSTMORTEMS_* se mostrarán automáticamente al encender SAP HANA Cloud.",
+                "RESULT_POSTMORTEMS_* metrics will appear automatically once SAP HANA Cloud is running.",
+            ),
+        ))
+        return hc
 
     inv = inventario_hana()
     logs = inv[inv["TABLE_NAME"].str.startswith("LOGS")]
@@ -148,16 +261,7 @@ def health_checks():
                   f"Last pipeline load: {ult:%d/%m/%Y %H:%M}. A new batch is expected every week.")
                if pd.notna(ult) else tr("No hay tablas de resultados.", "There are no result tables.")))
 
-    # Modelo
-    try:
-        for stx in STREAMS:
-            validar_firmas(wf.FEATURES[stx], firmas=wf.FIRMAS[stx])
-        hc.append((tr("Modelo", "Model"), tr("Firmas de clasificación", "Classification signatures"), "ok", "24 + 18 variables",
-                   tr("Cada variable del Isolation Forest tiene firma y no sobran firmas.",
-                      "Every Isolation Forest variable has a signature and there are no extra signatures.")))
-    except Exception as e:
-        hc.append((tr("Modelo", "Model"), tr("Firmas de clasificación", "Classification signatures"), "fail",
-                   tr("Inconsistentes", "Inconsistent"), str(e)[:160]))
+    # Modelo (metricas calculadas sobre HANA)
     tasa = resumen.groupby("STREAM")[["VENTANAS_ANOMALAS", "VENTANAS"]].sum()
     tasa = (tasa["VENTANAS_ANOMALAS"] / tasa["VENTANAS"]).to_dict()
     fuera = {k: v for k, v in tasa.items() if not 0.005 <= v <= 0.02}
@@ -219,7 +323,7 @@ def _html_checks(hc):
     return out + '</div>'
 
 
-def vista_health(tarjeta, estilo, mostrar):
+def vista_health(tarjeta, estilo, mostrar, hana_error=None):
     """Vista completa de Health checks. Recibe los helpers de UI del dashboard
     (tarjeta, estilo, mostrar) para no depender del script principal."""
     t0 = time.perf_counter()
@@ -227,9 +331,88 @@ def vista_health(tarjeta, estilo, mostrar):
         hc = health_checks()
     cuenta = {k: sum(1 for c in hc if c[2] == k) for k in estados_hc()}
     general = "fail" if cuenta["fail"] else "warn" if cuenta["warn"] else "ok"
+    hana_item = next((c for c in hc if c[1] == hc_conexion()), None)
+    hana_ok = bool(hana_item and hana_item[2] != "fail")
+
+    if not hana_ok:
+        detalle_hana = hana_error or (hana_item[4] if hana_item else "")
+        apagada = _es_hana_apagada(detalle_hana)
+        if apagada:
+            st.error(
+                tr(
+                    "La instancia de SAP HANA Cloud está apagada (código 1890). "
+                    "Enciéndela desde SAP HANA Cloud Central y presiona «Volver a revisar» para desbloquear el dashboard.",
+                    "The SAP HANA Cloud instance is stopped (code 1890). "
+                    "Start it from SAP HANA Cloud Central and click «Check again» to unlock the dashboard.",
+                ),
+                icon=":material/power_off:",
+            )
+        else:
+            st.error(
+                tr(
+                    "No fue posible conectar con SAP HANA Cloud. Verifica el estado de la instancia y presiona «Volver a revisar».",
+                    "Could not connect to SAP HANA Cloud. Verify the instance status and click «Check again».",
+                ),
+                icon=":material/error:",
+            )
+
+        otros = [
+            c for c in hc
+            if c[1] != hc_conexion() and c[0] in (tr("Infraestructura", "Infrastructure"), tr("Modelo", "Model"))
+        ]
+        otros_ok = sum(1 for c in otros if c[2] == "ok")
+        kpis = [
+            (
+                tr("Estado general", "Overall status"),
+                estados_hc()[general][0],
+                tr(
+                    f"{cuenta['ok']} correctas · {cuenta['warn']} con atención · {cuenta['fail']} con falla",
+                    f"{cuenta['ok']} OK · {cuenta['warn']} warnings · {cuenta['fail']} failures",
+                ),
+                estados_hc()[general][2],
+                tr("Resultado combinado de todas las verificaciones.", "Combined result of all checks."),
+            ),
+            (
+                "SAP HANA Cloud",
+                tr("Apagada", "Stopped") if apagada else tr("Sin conexión", "Offline"),
+                tr("Instancia detenida (1890)", "Instance stopped (1890)") if apagada else tr("No responde", "Unreachable"),
+                CRITICO,
+                tr("Base de datos principal requerida para las vistas de datos.", "Primary database required for analytics views."),
+            ),
+            (
+                tr("Otros servicios", "Other services"),
+                tr(f"{otros_ok} de {len(otros)} activos", f"{otros_ok} of {len(otros)} active"),
+                tr("Chatbot Sapy, Correo PDF, Gemini y Modelo", "Sapy Chatbot, PDF Email, Gemini & Model"),
+                "#188918" if otros_ok == len(otros) else "#E76500",
+                tr("Servicios independientes de HANA verificados en vivo.", "HANA-independent services verified live."),
+            ),
+            (
+                tr("Última revisión", "Last check"),
+                time.strftime("%H:%M:%S"),
+                tr(f"tomó {time.perf_counter() - t0:.1f} s", f"took {time.perf_counter() - t0:.1f} s"),
+                "#049F9A",
+                tr("Presiona Volver a revisar una vez encendida la instancia.", "Click Check again once the instance is running."),
+            ),
+        ]
+        st.html('<div class="kpis kpis-4">' + "".join(
+            f'<div class="kpi" style="--c:{c}" title="{html.escape(ayuda)}"><div class="lab"><i></i>{lab}</div>'
+            f'<div class="val">{val}</div><div class="det">{det}</div></div>'
+            for lab, val, det, c, ayuda in kpis) + '</div>')
+
+        with tarjeta(tr("Verificaciones del sistema", "System checks"),
+                     tr("Estado de SAP HANA Cloud y de los demás servicios de la plataforma.",
+                        "Status of SAP HANA Cloud and all other platform services.")):
+            if st.button(tr("Volver a revisar", "Check again"), icon=":material/refresh:",
+                         type="primary", key="hc_refrescar_offline"):
+                reiniciar_conexion()
+                st.cache_data.clear()
+                st.rerun()
+            st.html(_html_checks(hc))
+        return
+
     inv = inventario_hana()
     logs = inv[inv["TABLE_NAME"].str.startswith("LOGS")]
-    lat = next((c[3] for c in hc if c[1] == hc_conexion()), "N/A")
+    lat = hana_item[3] if hana_item else "N/A"
     kpis = [
         (tr("Estado general", "Overall status"), estados_hc()[general][0],
          tr(f"{cuenta['ok']} correctas · {cuenta['warn']} con atención · {cuenta['fail']} con falla",
@@ -254,9 +437,8 @@ def vista_health(tarjeta, estilo, mostrar):
                  tr("Estado de la infraestructura, los datos, el modelo y el agente forense.",
                     "Status of the infrastructure, the data, the model and the forensic agent.")):
         if st.button(tr("Volver a revisar", "Check again"), icon=":material/refresh:", key="hc_refrescar"):
-            inventario_hana.clear()
-            metricas_pipeline.clear()
-            leer_postmortems.clear()
+            reiniciar_conexion()
+            st.cache_data.clear()
             st.rerun()
         st.html(_html_checks(hc))
 
