@@ -8,6 +8,7 @@ en documentos PDF con formato corporativo SAP / SOC (ReportLab).
 import os
 import sys
 import re
+from pathlib import Path
 from functools import partial
 from typing import Dict, Any, List
 from reportlab.lib.pagesizes import letter
@@ -204,6 +205,9 @@ def _md_to_reportlab(text: str) -> str:
     return t
 
 
+_FORESTIA_ICON_PNG = Path(__file__).resolve().parent / "dashboard" / "componentes" / "forestia_icon.png"
+
+
 class NumberedCanvas(canvas.Canvas):
     """Canvas de dos pasadas para calcular y numerar paginas: 'Pagina X de Y'."""
     def __init__(self, *args, idioma: str = 'es', **kwargs):
@@ -227,16 +231,32 @@ class NumberedCanvas(canvas.Canvas):
         w, h = letter
         self.saveState()
 
-        # Header corporativo SAP
+        # Header corporativo Forestia / SAP
         self.setFillColor(SAP_NAVY)
         self.rect(0, h - 8, w, 8, fill=1, stroke=0)
         self.setFillColor(SAP_BLUE)
         self.rect(0, h - 8, 120, 8, fill=1, stroke=0)
 
-        # Header texto
+        # Header icono y texto
+        title_x = 36
+        if _FORESTIA_ICON_PNG.exists():
+            try:
+                self.drawImage(
+                    str(_FORESTIA_ICON_PNG),
+                    36,
+                    h - 24.5,
+                    width=11.5,
+                    height=12.0,
+                    mask='auto',
+                    preserveAspectRatio=True,
+                )
+                title_x = 51
+            except Exception:
+                title_x = 36
+
         self.setFont("Helvetica-Bold", 8)
         self.setFillColor(SAP_NAVY)
-        self.drawString(36, h - 22, "SAP CLOUD OBSERVABILITY & SECURITY OPERATIONS")
+        self.drawString(title_x, h - 22, "FORESTIA  |  SAP CLOUD OBSERVABILITY & SECURITY OPERATIONS")
 
         self.setFont("Helvetica", 8)
         self.setFillColor(SAP_MUTED)

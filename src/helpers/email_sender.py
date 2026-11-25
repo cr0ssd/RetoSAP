@@ -226,7 +226,7 @@ def _construir_cuerpo_correo(
       </table>
       {nota_html}
       <p style="margin:16px 0 0;font-size:12px;color:#64748B;">
-        Documento confidencial de operaciones de seguridad (SOC). Generado automaticamente desde el Dashboard de Anomalias SAP.
+        Documento confidencial de operaciones de seguridad (SOC). Generado automaticamente desde Forestia · SAP Cloud Observability.
       </p>
     </div>
   </div>
@@ -242,7 +242,7 @@ def _construir_cuerpo_correo(
         f"- Tacticas MITRE: {n_tacticas}\n"
         f"- Aplicaciones SAP afectadas: {n_apps}\n"
         f"{nota_txt}\n"
-        f"Documento confidencial generado desde el Dashboard de Anomalias SAP."
+        f"Documento confidencial generado desde Forestia · SAP Cloud Observability."
     )
     return html_body, text_body
 
