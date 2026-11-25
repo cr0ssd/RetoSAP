@@ -64,7 +64,7 @@ def conf_txt(c):
 # Modularización
 from tema import (BRAND, NAVY, GOLD, SERIES, INK, INK2, MUTED, GRID, AXIS, NEUTRO, SURFACE,
                   CARD_BORDER, PAGE, DIV_MID, CRITICO, AZUL_SEQ, CONFIANZA_COLOR)
-from datos_hana import _conn, reiniciar_conexion, leer, leer_postmortems, _parse_json_safe
+from datos_hana import _conn, ping_hana_rapido, reiniciar_conexion, leer, leer_postmortems, _parse_json_safe
 from health import estados_hc, inventario_hana, metricas_pipeline, vista_health, _es_hana_apagada
 
 def _declarar_grafica_rango():
@@ -657,11 +657,13 @@ def perfil_relevantes(win, rel, familias):
 
 # Barra lateral y compuerta de disponibilidad de SAP HANA Cloud
 _hana_error = None
-try:
-    meses = meses_disponibles()
-except Exception as e:
-    meses = []
-    _hana_error = str(e)
+meses = []
+with st.spinner(tr("Verificando conexión con SAP HANA Cloud…", "Checking SAP HANA Cloud connection…")):
+    try:
+        ping_hana_rapido()
+        meses = meses_disponibles()
+    except Exception as e:
+        _hana_error = str(e)
 
 if _hana_error or not meses:
     _apagada = _es_hana_apagada(_hana_error) if _hana_error else False
@@ -755,6 +757,7 @@ with st.sidebar:
     st.caption(tr(f"Reportes forenses del periodo: **{len(pm_all)}** ({pm_stream_n} de {STREAMS[STREAM]})",
                   f"Forensic reports in the period: **{len(pm_all)}** ({pm_stream_n} from {STREAMS[STREAM]})"))
     if st.button(tr("Actualizar datos en vivo", "Refresh live data"), icon=":material/refresh:", width="stretch"):
+        reiniciar_conexion()
         st.cache_data.clear()
         st.rerun()
 

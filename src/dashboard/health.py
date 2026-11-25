@@ -11,7 +11,7 @@ import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
 
-from datos_hana import _conn, reiniciar_conexion, leer, leer_postmortems, _parse_json_safe
+from datos_hana import _conn, ping_hana_rapido, reiniciar_conexion, leer, leer_postmortems, _parse_json_safe
 from helpers.clasificacion import validar_firmas
 from helpers.email_sender import estado_servicio_correo
 from helpers.IsolationForest import CONTAMINATION as CONTAMINATION_IF
@@ -73,11 +73,8 @@ def metricas_pipeline(meses_proc):
 
 
 def _ping_hana():
-    t = time.perf_counter()
-    cur = _conn().connection.cursor()
-    cur.execute("SELECT 1 FROM DUMMY")
-    cur.close()
-    return (time.perf_counter() - t) * 1000
+    ping_hana_rapido.clear()
+    return ping_hana_rapido()
 
 
 def hc_conexion():
@@ -133,22 +130,28 @@ def _check_email_service():
     return ("warn", tr("No configurado", "Not configured"), est["hint"])
 
 
-def health_checks():
+def health_checks(hana_error_previo=None):
     """Lista de verificaciones: (grupo, nombre, estado, valor, detalle)."""
     hc = []
     hana_ok = True
     hana_err = None
 
     # Infraestructura: SAP HANA + servicios externos/locales del entorno
-    try:
-        ms = _ping_hana()
-        hc.append((tr("Infraestructura", "Infrastructure"), hc_conexion(),
-                   "ok" if ms < 500 else "warn" if ms < 2000 else "fail", f"{ms:.0f} ms",
-                   tr("Tiempo de respuesta de una consulta mínima (SELECT 1 FROM DUMMY).",
-                      "Response time of a minimal query (SELECT 1 FROM DUMMY).")))
-    except Exception as e:
+    if hana_error_previo:
         hana_ok = False
-        hana_err = str(e)
+        hana_err = str(hana_error_previo)
+    else:
+        try:
+            ms = _ping_hana()
+            hc.append((tr("Infraestructura", "Infrastructure"), hc_conexion(),
+                       "ok" if ms < 500 else "warn" if ms < 2000 else "fail", f"{ms:.0f} ms",
+                       tr("Tiempo de respuesta de una consulta mínima (SELECT 1 FROM DUMMY).",
+                          "Response time of a minimal query (SELECT 1 FROM DUMMY).")))
+        except Exception as e:
+            hana_ok = False
+            hana_err = str(e)
+
+    if not hana_ok:
         if _es_hana_apagada(hana_err):
             hc.append((
                 tr("Infraestructura", "Infrastructure"),
@@ -162,7 +165,7 @@ def health_checks():
             ))
         else:
             hc.append((tr("Infraestructura", "Infrastructure"), hc_conexion(), "fail",
-                       tr("Sin conexión", "No connection"), hana_err[:180]))
+                       tr("Sin conexión", "No connection"), str(hana_err)[:180]))
 
     if hana_ok:
         hc.append((tr("Infraestructura", "Infrastructure"), tr("Versión de SAP HANA", "SAP HANA version"), "info", version_hana(),
@@ -328,7 +331,7 @@ def vista_health(tarjeta, estilo, mostrar, hana_error=None):
     (tarjeta, estilo, mostrar) para no depender del script principal."""
     t0 = time.perf_counter()
     with st.spinner(tr("Revisando el sistema…", "Checking the system…")):
-        hc = health_checks()
+        hc = health_checks(hana_error_previo=hana_error)
     cuenta = {k: sum(1 for c in hc if c[2] == k) for k in estados_hc()}
     general = "fail" if cuenta["fail"] else "warn" if cuenta["warn"] else "ok"
     hana_item = next((c for c in hc if c[1] == hc_conexion()), None)

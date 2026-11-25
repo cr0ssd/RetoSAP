@@ -1,23 +1,49 @@
 """Acceso a SAP HANA compartido por el dashboard y el módulo de health checks."""
 import json
+import time
 
 import pandas as pd
 import streamlit as st
 
 import hana_ml.dataframe as hana_df
+import hdbcli.dbapi as hdbapi
 
 from helpers.conexion import _params
 
 
 @st.cache_resource(show_spinner=False)
 def _crear_conexion():
-    # Tiempo límite de 2 min por consulta: si la red se cae, falla en lugar de quedarse colgada.
-    return hana_df.ConnectionContext(**_params(), communicationTimeout=120000)
+    # Tiempo límite de 2 min por consulta y 8 s al conectar: evita bloqueos largos si HANA esta apagada.
+    return hana_df.ConnectionContext(**_params(), communicationTimeout=120000, connectTimeout=8000)
+
+
+@st.cache_data(ttl=15, show_spinner=False)
+def ping_hana_rapido():
+    """Sonda rapida (max 5 s) para confirmar si SAP HANA Cloud esta encendida y accesible."""
+    t0 = time.perf_counter()
+    conn = None
+    try:
+        conn = hdbapi.connect(**_params(), connectTimeout=5000, communicationTimeout=5000)
+        cur = conn.cursor()
+        cur.execute("SELECT 1 FROM DUMMY")
+        cur.fetchall()
+        cur.close()
+        return (time.perf_counter() - t0) * 1000.0
+    except Exception:
+        _crear_conexion.clear()
+        raise
+    finally:
+        if conn is not None:
+            try:
+                conn.close()
+            except Exception:
+                pass
 
 
 def reiniciar_conexion():
-    """Limpia la conexion en cache para forzar una reconexion limpia con SAP HANA."""
+    """Limpia la conexion y la sonda en cache para forzar una reconexion limpia con SAP HANA."""
     _crear_conexion.clear()
+    ping_hana_rapido.clear()
 
 
 def _conn():
