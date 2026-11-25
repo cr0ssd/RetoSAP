@@ -8,6 +8,7 @@ en documentos PDF con formato corporativo SAP / SOC (ReportLab).
 import os
 import sys
 import re
+from functools import partial
 from typing import Dict, Any, List
 from reportlab.lib.pagesizes import letter
 from reportlab.lib import colors
@@ -29,6 +30,164 @@ SAP_CODE_BG = colors.HexColor('#F1F5F9')
 SAP_CODE_BORDER = colors.HexColor('#CBD5E1')
 
 
+# Textos fijos del PDF en español e inglés. El contenido narrativo (resumen y reporte Markdown)
+# llega ya en el idioma elegido desde quien llama (agente o dashboard).
+TEXTOS = {
+    'es': {
+        'hdr_der': "REPORTE FORENSE POSTMORTEM | CONFIDENCIAL",
+        'pie': "Generado por Agente Forense Autónomo (Model Context Protocol + SAP HANA Cloud)",
+        'pagina': "Página {n} de {t}",
+        'titulo': "REPORTE FORENSE POSTMORTEM",
+        'confianza': "CONFIANZA", 'escalas': "ESCALAS", 'evento_id': "Evento ID", 'vector': "Vector",
+        'intervalo': "Intervalo",
+        's1': "1. Resumen Ejecutivo y Clasificacion de la Amenaza",
+        'vector_clasif': "Vector Clasificado:", 'marco_mitre': "Marco MITRE ATT&amp;CK:",
+        'escalas_ventana': "Escalas de Ventana:", 'metrica': "Metrica Mas Desviada:",
+        'ventanas_imp': "Ventanas Impactadas:", 'ventanas_consec': "{n} ventanas consecutivas",
+        'dictamen': "Dictamen Forense:",
+        's2': "2. Linea de Tiempo Cronologica (Incident Timeline)",
+        'hito': "Hito Operativo", 'marca': "Marca Temporal (UTC)", 'detalle': "Detalle Forense Observado",
+        't0': "T0 - Inicio Anomalia", 't0_d': "Primer cruce de umbral detectado por Isolation Forest.",
+        't1': "T1 - Pico de Impacto", 't1_d': "Maximo z-score ({z}) en {f}.",
+        't2': "T2 - Fin de Intervalo", 't2_d': "Cese de la actividad anomala o restablecimiento del baseline.",
+        's3': "3. Sistemas, Servicios y Componentes SAP Comprometidos",
+        'apps_def': "Servicios internos de plataforma SAP", 'ips_def': "Trafico interno / Gateway proxy",
+        'adicionales': "adicionales", 'apps_sap': "Aplicaciones SAP:", 'ips_muestreados': "Origenes IP Muestreados:",
+        's4': "4. Analisis de Causa Raiz y Evidencia Forense de Logs",
+        'analisis_def': "Analisis pericial basado en telemetria correlacionada.",
+        'muestra_logs': "Muestra de Evidencia en Logs Crudos (MCP Sample):",
+        's5': "5. Plan de Mitigacion y Recomendaciones de Hardening",
+        'mitig_def': [
+            "1. <b>Contencion Inmediata:</b> Aislamiento de sesiones activas y bloqueo de rangos IP anomalos en WAF.",
+            "2. <b>Rate Limiting y Timeouts:</b> Restriccion temporal de concurrencia sobre los endpoints afectados.",
+            "3. <b>Revision de Autorizaciones:</b> Auditoria estricta de politicas RBAC y llamadas a herramientas del LLM.",
+            "4. <b>Monitoreo Reforzado:</b> Calibracion continua del Isolation Forest para deteccion temprana de recurrencias.",
+        ],
+        'sev': ("Crítico", "Grave", "Moderado"),
+        # Dossier mensual
+        'm_titulo': "DOSSIER FORENSE POSTMORTEM MENSUAL", 'm_incidentes': "INCIDENTES UNICOS",
+        'm_tacticas': "TACTICAS MITRE", 'm_cobertura': "Cobertura Temporal", 'm_corrientes': "Corrientes",
+        'm_apps': "Apps SAP",
+        'm_s1': "1. Resumen Ejecutivo Consolidado y Panorama de Amenazas del Mes",
+        'm_dictamen': (
+            "Durante el periodo <b>{periodo}</b> ({ini} a {fin} UTC), el pipeline de observabilidad con Isolation "
+            "Forest en SAP HANA Cloud y el Agente Forense MCP correlacionaron <b>{n}</b> incidentes relevantes unicos "
+            "tras deduplicacion multi-escala (5min, 15min, 30min, 1h y 3h): <b>{n_sys}</b> sobre infraestructura y "
+            "aplicaciones core SAP (stream SYSTEM) y <b>{n_llm}</b> sobre servicios de inferencia de IA generativa "
+            "(stream LLM). La actividad maliciosa y anomala se agrupo en <b>{n_fam}</b> familias de amenaza: {fams}, "
+            "mapeadas a <b>{n_tac}</b> tactica(s) MITRE ATT&amp;CK / ATLAS e impactando un total de <b>{n_apps}</b> "
+            "aplicacion(es) SAP y <b>{n_ips}</b> origen(es) IP unicos."),
+        'm_dictamen_tit': "Dictamen Forense Consolidado del Periodo:",
+        'm_camp_cols': ("Campana / Vector", "Stream", "Tactica y Tecnica MITRE", "Inc.", "Escalas Detectadas",
+                        "Indicador Dominante (Z-Max)", "Servicios SAP Impactados"),
+        'm_plataforma': "Plataforma SAP",
+        'm_s2': "2. Cronologia Maestra de Incidentes Multi-Escala del Periodo",
+        'm_crono_cols': ("Expediente", "Origen", "Vector / Ataque", "Ventana Temporal (UTC)"),
+        'm_s3': "3. Analisis Forense Unificado por Familia de Amenaza y Evidencia MCP",
+        'm_s3_intro': (
+            "A continuacion se consolida el analisis pericial de causa raiz, las sintesis ejecutivas redactadas "
+            "por Gemini para cada incidente y las muestras representativas de logs crudos extraidos via MCP desde "
+            "SAP HANA Cloud, agrupados por vector de ataque para eliminar redundancia operativa."),
+        'm_campana': "3.{i} Campana: {v} ({n} incidente(s) | Stream: {s} | Escalas: {e})",
+        'm_patron_def': "Patron anomalo detectado por Isolation Forest.",
+        'm_marco': "Marco MITRE:", 'm_apps_sap': "Aplicaciones SAP:", 'm_apps_def': "Servicios internos SAP",
+        'm_ips': "IPs Involucradas:", 'm_causa': "Mecanismo y Causa Raiz:",
+        'm_inc_cols': ("Expediente y Ventana (UTC)", "Severidad", "Hallazgo Forense Puntual (Sintesis Gemini)"),
+        'm_evidencia': "Evidencia MCP (Logs Crudos):",
+        'm_s4': "4. Correlacion Multi-Escala (5min a 3h) y Superficie de Impacto SAP",
+        'm_esc_cols': ("Longitud de Ventana", "Incidentes Detectados", "Exclusivos de esta Escala",
+                       "Vectores Observados en la Escala"),
+        'm_de': "{a} de {b}", 'm_correlacionados': "0 (correlacionados)",
+        'm_app_cols': ("Aplicacion / Servicio SAP", "Incidentes Asociados",
+                       "Vectores de Amenaza Observados sobre el Activo"),
+        'm_incidentes_n': "{n} incidente(s)",
+        'm_s5': "5. Plan Maestro Consolidado de Contencion y Hardening del Mes",
+        'm_acciones_def': [
+            "<b>[Proteccion Perimetral y WAF]:</b> Bloqueo automatizado de rangos IP anomalos y rate-limiting dinamico por endpoint SAP.",
+            "<b>[Seguridad de Identidad y Contexto SAP]:</b> Enforzar MFA, rotacion de sesiones y validacion estricta de cabeceras y payloads.",
+            "<b>[Guardrails de IA Generativa / LLM]:</b> Aislar directivas de sistema, filtrar Prompt Injection y limitar cuotas de tokens por SERVICE_ID.",
+        ],
+    },
+    'en': {
+        'hdr_der': "FORENSIC POSTMORTEM REPORT | CONFIDENTIAL",
+        'pie': "Generated by Autonomous Forensic Agent (Model Context Protocol + SAP HANA Cloud)",
+        'pagina': "Page {n} of {t}",
+        'titulo': "FORENSIC POSTMORTEM REPORT",
+        'confianza': "CONFIDENCE", 'escalas': "SCALES", 'evento_id': "Event ID", 'vector': "Vector",
+        'intervalo': "Interval",
+        's1': "1. Executive Summary and Threat Classification",
+        'vector_clasif': "Classified Vector:", 'marco_mitre': "MITRE ATT&amp;CK Framework:",
+        'escalas_ventana': "Window Scales:", 'metrica': "Most Deviated Metric:",
+        'ventanas_imp': "Impacted Windows:", 'ventanas_consec': "{n} consecutive windows",
+        'dictamen': "Forensic Verdict:",
+        's2': "2. Chronological Timeline (Incident Timeline)",
+        'hito': "Operational Milestone", 'marca': "Timestamp (UTC)", 'detalle': "Observed Forensic Detail",
+        't0': "T0 - Anomaly Start", 't0_d': "First threshold crossing detected by Isolation Forest.",
+        't1': "T1 - Peak Impact", 't1_d': "Maximum z-score ({z}) in {f}.",
+        't2': "T2 - End of Interval", 't2_d': "End of the anomalous activity or baseline restored.",
+        's3': "3. Compromised SAP Systems, Services and Components",
+        'apps_def': "Internal SAP platform services", 'ips_def': "Internal traffic / Gateway proxy",
+        'adicionales': "more", 'apps_sap': "SAP Applications:", 'ips_muestreados': "Sampled IP Sources:",
+        's4': "4. Root Cause Analysis and Forensic Log Evidence",
+        'analisis_def': "Expert analysis based on correlated telemetry.",
+        'muestra_logs': "Raw Log Evidence Sample (MCP Sample):",
+        's5': "5. Mitigation Plan and Hardening Recommendations",
+        'mitig_def': [
+            "1. <b>Immediate Containment:</b> Isolate active sessions and block anomalous IP ranges in the WAF.",
+            "2. <b>Rate Limiting and Timeouts:</b> Temporarily restrict concurrency on the affected endpoints.",
+            "3. <b>Authorization Review:</b> Strict audit of RBAC policies and LLM tool calls.",
+            "4. <b>Reinforced Monitoring:</b> Continuous Isolation Forest calibration for early detection of recurrences.",
+        ],
+        'sev': ("Critical", "Severe", "Moderate"),
+        'm_titulo': "MONTHLY FORENSIC POSTMORTEM DOSSIER", 'm_incidentes': "UNIQUE INCIDENTS",
+        'm_tacticas': "MITRE TACTICS", 'm_cobertura': "Time Coverage", 'm_corrientes': "Streams",
+        'm_apps': "SAP Apps",
+        'm_s1': "1. Consolidated Executive Summary and Monthly Threat Landscape",
+        'm_dictamen': (
+            "During the period <b>{periodo}</b> ({ini} to {fin} UTC), the observability pipeline with Isolation "
+            "Forest on SAP HANA Cloud and the MCP Forensic Agent correlated <b>{n}</b> unique relevant incidents "
+            "after multi-scale deduplication (5min, 15min, 30min, 1h and 3h): <b>{n_sys}</b> on SAP core "
+            "infrastructure and applications (SYSTEM stream) and <b>{n_llm}</b> on generative AI inference "
+            "services (LLM stream). The malicious and anomalous activity was grouped into <b>{n_fam}</b> threat "
+            "families: {fams}, mapped to <b>{n_tac}</b> MITRE ATT&amp;CK / ATLAS tactic(s) and impacting a total "
+            "of <b>{n_apps}</b> SAP application(s) and <b>{n_ips}</b> unique IP source(s)."),
+        'm_dictamen_tit': "Consolidated Forensic Verdict for the Period:",
+        'm_camp_cols': ("Campaign / Vector", "Stream", "MITRE Tactic and Technique", "Inc.", "Detected Scales",
+                        "Dominant Indicator (Z-Max)", "Impacted SAP Services"),
+        'm_plataforma': "SAP Platform",
+        'm_s2': "2. Master Timeline of Multi-Scale Incidents in the Period",
+        'm_crono_cols': ("Case", "Source", "Vector / Attack", "Time Window (UTC)"),
+        'm_s3': "3. Unified Forensic Analysis by Threat Family and MCP Evidence",
+        'm_s3_intro': (
+            "This section consolidates the expert root cause analysis, the executive summaries written by Gemini "
+            "for each incident and representative raw log samples extracted via MCP from SAP HANA Cloud, grouped "
+            "by attack vector to remove operational redundancy."),
+        'm_campana': "3.{i} Campaign: {v} ({n} incident(s) | Stream: {s} | Scales: {e})",
+        'm_patron_def': "Anomalous pattern detected by Isolation Forest.",
+        'm_marco': "MITRE Framework:", 'm_apps_sap': "SAP Applications:", 'm_apps_def': "Internal SAP services",
+        'm_ips': "Involved IPs:", 'm_causa': "Mechanism and Root Cause:",
+        'm_inc_cols': ("Case and Window (UTC)", "Severity", "Specific Forensic Finding (Gemini Summary)"),
+        'm_evidencia': "MCP Evidence (Raw Logs):",
+        'm_s4': "4. Multi-Scale Correlation (5min to 3h) and SAP Impact Surface",
+        'm_esc_cols': ("Window Length", "Detected Incidents", "Exclusive to this Scale",
+                       "Vectors Observed at this Scale"),
+        'm_de': "{a} of {b}", 'm_correlacionados': "0 (correlated)",
+        'm_app_cols': ("SAP Application / Service", "Associated Incidents", "Threat Vectors Observed on the Asset"),
+        'm_incidentes_n': "{n} incident(s)",
+        'm_s5': "5. Consolidated Master Containment and Hardening Plan for the Month",
+        'm_acciones_def': [
+            "<b>[Perimeter Protection and WAF]:</b> Automated blocking of anomalous IP ranges and dynamic rate limiting per SAP endpoint.",
+            "<b>[Identity Security and SAP Context]:</b> Enforce MFA, session rotation and strict header and payload validation.",
+            "<b>[Generative AI / LLM Guardrails]:</b> Isolate system directives, filter Prompt Injection and limit token quotas per SERVICE_ID.",
+        ],
+    },
+}
+
+
+def _tx(idioma: str) -> Dict[str, Any]:
+    return TEXTOS.get(idioma, TEXTOS['es'])
+
+
 def _md_to_reportlab(text: str) -> str:
     """Convierte marcas markdown basicas (** y `) a etiquetas XML seguras para ReportLab."""
     if not text:
@@ -47,9 +206,10 @@ def _md_to_reportlab(text: str) -> str:
 
 class NumberedCanvas(canvas.Canvas):
     """Canvas de dos pasadas para calcular y numerar paginas: 'Pagina X de Y'."""
-    def __init__(self, *args, **kwargs):
+    def __init__(self, *args, idioma: str = 'es', **kwargs):
         super().__init__(*args, **kwargs)
         self.pages = []
+        self.T = _tx(idioma)
 
     def showPage(self):
         self.pages.append(dict(self.__dict__))
@@ -80,7 +240,7 @@ class NumberedCanvas(canvas.Canvas):
 
         self.setFont("Helvetica", 8)
         self.setFillColor(SAP_MUTED)
-        self.drawRightString(w - 36, h - 22, "REPORTE FORENSE POSTMORTEM | CONFIDENCIAL")
+        self.drawRightString(w - 36, h - 22, self.T['hdr_der'])
 
         self.setStrokeColor(SAP_BORDER)
         self.setLineWidth(0.5)
@@ -90,9 +250,9 @@ class NumberedCanvas(canvas.Canvas):
         self.line(36, 32, w - 36, 32)
         self.setFont("Helvetica", 8)
         self.setFillColor(SAP_MUTED)
-        self.drawString(36, 20, "Generado por Agente Forense Autónomo (Model Context Protocol + SAP HANA Cloud)")
-        
-        page_str = f"Página {self._pageNumber} de {total_pages}"
+        self.drawString(36, 20, self.T['pie'])
+
+        page_str = self.T['pagina'].format(n=self._pageNumber, t=total_pages)
         self.drawRightString(w - 36, 20, page_str)
 
         self.restoreState()
@@ -143,8 +303,10 @@ def _build_styles() -> Dict[str, ParagraphStyle]:
     }
 
 
-def _append_incident_story(story: List[Any], postmortem_data: Dict[str, Any], st: Dict[str, ParagraphStyle]):
+def _append_incident_story(story: List[Any], postmortem_data: Dict[str, Any], st: Dict[str, ParagraphStyle],
+                           idioma: str = 'es'):
     """Agrega las 5 secciones ejecutivas de un incidente al flujo ReportLab."""
+    T = _tx(idioma)
     title_style = st['title']
     meta_style = st['meta']
     sec_title_style = st['sec_title']
@@ -168,7 +330,10 @@ def _append_incident_story(story: List[Any], postmortem_data: Dict[str, Any], st
     inc_meta = meta.get('incident_meta', {}) or {}
     z_max = float(inc_meta.get('z_max', 0.0) or 0.0)
     z_feat = str(inc_meta.get('z_max_feature', 'N/A'))
-    confianza = str(inc_meta.get('confianza', 'alta')).upper()
+    confianza = str(inc_meta.get('confianza', 'alta'))
+    if idioma == 'en':
+        confianza = {'alta': 'high', 'media': 'medium', 'baja': 'low'}.get(confianza.lower(), confianza)
+    confianza = confianza.upper()
     n_ventanas = int(inc_meta.get('n_ventanas', 1) or 1)
     escalas = (
         meta.get('escalas_detectadas')
@@ -179,12 +344,12 @@ def _append_incident_story(story: List[Any], postmortem_data: Dict[str, Any], st
 
     header_table_data = [
         [
-            Paragraph(f"REPORTE FORENSE POSTMORTEM: {_md_to_reportlab(pm_id)}", title_style),
-            Paragraph(f"<b>CONFIANZA:</b> {_md_to_reportlab(confianza)}<br/><b>ESCALAS:</b> {_md_to_reportlab(escalas_str)}", table_cell_bold)
+            Paragraph(f"{T['titulo']}: {_md_to_reportlab(pm_id)}", title_style),
+            Paragraph(f"<b>{T['confianza']}:</b> {_md_to_reportlab(confianza)}<br/><b>{T['escalas']}:</b> {_md_to_reportlab(escalas_str)}", table_cell_bold)
         ],
         [
-            Paragraph(f"<b>Evento ID:</b> {evento_id} &nbsp;|&nbsp; <b>Stream:</b> {_md_to_reportlab(stream)} &nbsp;|&nbsp; <b>Vector:</b> {_md_to_reportlab(tipo_ataque)}", meta_style),
-            Paragraph(f"<b>Intervalo:</b> {_md_to_reportlab(str(inicio))} &rarr; {_md_to_reportlab(str(fin))}", meta_style)
+            Paragraph(f"<b>{T['evento_id']}:</b> {evento_id} &nbsp;|&nbsp; <b>Stream:</b> {_md_to_reportlab(stream)} &nbsp;|&nbsp; <b>{T['vector']}:</b> {_md_to_reportlab(tipo_ataque)}", meta_style),
+            Paragraph(f"<b>{T['intervalo']}:</b> {_md_to_reportlab(str(inicio))} &rarr; {_md_to_reportlab(str(fin))}", meta_style)
         ]
     ]
     t_header = Table(header_table_data, colWidths=[410, 130])
@@ -197,14 +362,14 @@ def _append_incident_story(story: List[Any], postmortem_data: Dict[str, Any], st
     story.append(Spacer(1, 4))
     story.append(HRFlowable(width="100%", thickness=1, color=SAP_BLUE, spaceBefore=2, spaceAfter=6))
 
-    story.append(Paragraph("1. Resumen Ejecutivo y Clasificacion de la Amenaza", sec_title_style))
+    story.append(Paragraph(T['s1'], sec_title_style))
 
     c1_meta = [
-        [Paragraph("<b>Vector Clasificado:</b>", table_cell_bold), Paragraph(_md_to_reportlab(tipo_ataque), table_cell_style)],
-        [Paragraph("<b>Marco MITRE ATT&amp;CK:</b>", table_cell_bold), Paragraph(_md_to_reportlab(mitre_tactic), table_cell_style)],
-        [Paragraph("<b>Escalas de Ventana:</b>", table_cell_bold), Paragraph(_md_to_reportlab(escalas_str), table_cell_style)],
-        [Paragraph("<b>Metrica Mas Desviada:</b>", table_cell_bold), Paragraph(f"{_md_to_reportlab(z_feat)} (Z = {z_max:.2f})", table_cell_style)],
-        [Paragraph("<b>Ventanas Impactadas:</b>", table_cell_bold), Paragraph(f"{n_ventanas} ventanas consecutivas", table_cell_style)],
+        [Paragraph(f"<b>{T['vector_clasif']}</b>", table_cell_bold), Paragraph(_md_to_reportlab(tipo_ataque), table_cell_style)],
+        [Paragraph(f"<b>{T['marco_mitre']}</b>", table_cell_bold), Paragraph(_md_to_reportlab(mitre_tactic), table_cell_style)],
+        [Paragraph(f"<b>{T['escalas_ventana']}</b>", table_cell_bold), Paragraph(_md_to_reportlab(escalas_str), table_cell_style)],
+        [Paragraph(f"<b>{T['metrica']}</b>", table_cell_bold), Paragraph(f"{_md_to_reportlab(z_feat)} (Z = {z_max:.2f})", table_cell_style)],
+        [Paragraph(f"<b>{T['ventanas_imp']}</b>", table_cell_bold), Paragraph(T['ventanas_consec'].format(n=n_ventanas), table_cell_style)],
     ]
     t_c1_meta = Table(c1_meta, colWidths=[130, 400])
     t_c1_meta.setStyle(TableStyle([
@@ -218,7 +383,7 @@ def _append_incident_story(story: List[Any], postmortem_data: Dict[str, Any], st
     story.append(Spacer(1, 4))
 
     card_resumen = [
-        [Paragraph(f"<b>Dictamen Forense:</b> {_md_to_reportlab(resumen)}", exec_summary_style)]
+        [Paragraph(f"<b>{T['dictamen']}</b> {_md_to_reportlab(resumen)}", exec_summary_style)]
     ]
     t_resumen = Table(card_resumen, colWidths=[540])
     t_resumen.setStyle(TableStyle([
@@ -232,14 +397,14 @@ def _append_incident_story(story: List[Any], postmortem_data: Dict[str, Any], st
     story.append(t_resumen)
     story.append(Spacer(1, 6))
 
-    story.append(Paragraph("2. Linea de Tiempo Cronologica (Incident Timeline)", sec_title_style))
+    story.append(Paragraph(T['s2'], sec_title_style))
 
     pico_ts = inc_meta.get('ventana_pico', inicio)
     timeline_rows = [
-        [Paragraph("Hito Operativo", table_cell_bold), Paragraph("Marca Temporal (UTC)", table_cell_bold), Paragraph("Detalle Forense Observado", table_cell_bold)],
-        [Paragraph("T0 - Inicio Anomalia", table_cell_bold), Paragraph(_md_to_reportlab(str(inicio)), table_cell_style), Paragraph("Primer cruce de umbral detectado por Isolation Forest.", table_cell_style)],
-        [Paragraph("T1 - Pico de Impacto", table_cell_bold), Paragraph(_md_to_reportlab(str(pico_ts)), table_cell_style), Paragraph(f"Maximo z-score ({z_max:.2f}) en {_md_to_reportlab(z_feat)}.", table_cell_style)],
-        [Paragraph("T2 - Fin de Intervalo", table_cell_bold), Paragraph(_md_to_reportlab(str(fin)), table_cell_style), Paragraph("Cese de la actividad anomala o restablecimiento del baseline.", table_cell_style)],
+        [Paragraph(T['hito'], table_cell_bold), Paragraph(T['marca'], table_cell_bold), Paragraph(T['detalle'], table_cell_bold)],
+        [Paragraph(T['t0'], table_cell_bold), Paragraph(_md_to_reportlab(str(inicio)), table_cell_style), Paragraph(T['t0_d'], table_cell_style)],
+        [Paragraph(T['t1'], table_cell_bold), Paragraph(_md_to_reportlab(str(pico_ts)), table_cell_style), Paragraph(T['t1_d'].format(z=f"{z_max:.2f}", f=_md_to_reportlab(z_feat)), table_cell_style)],
+        [Paragraph(T['t2'], table_cell_bold), Paragraph(_md_to_reportlab(str(fin)), table_cell_style), Paragraph(T['t2_d'], table_cell_style)],
     ]
     t_timeline = Table(timeline_rows, colWidths=[110, 120, 310])
     t_timeline.setStyle(TableStyle([
@@ -252,18 +417,18 @@ def _append_incident_story(story: List[Any], postmortem_data: Dict[str, Any], st
     story.append(t_timeline)
     story.append(Spacer(1, 6))
 
-    story.append(Paragraph("3. Sistemas, Servicios y Componentes SAP Comprometidos", sec_title_style))
+    story.append(Paragraph(T['s3'], sec_title_style))
 
     apps = postmortem_data.get('aplicaciones_afectadas', [])
-    apps_str = ", ".join(f"<b>{_md_to_reportlab(a)}</b>" for a in apps) if apps else "Servicios internos de plataforma SAP"
+    apps_str = ", ".join(f"<b>{_md_to_reportlab(a)}</b>" for a in apps) if apps else T['apps_def']
     ips = postmortem_data.get('ips_involucradas', [])
-    ips_str = ", ".join(_md_to_reportlab(ip) for ip in ips[:8]) if ips else "Trafico interno / Gateway proxy"
+    ips_str = ", ".join(_md_to_reportlab(ip) for ip in ips[:8]) if ips else T['ips_def']
     if len(ips) > 8:
-        ips_str += f" (+{len(ips) - 8} adicionales)"
+        ips_str += f" (+{len(ips) - 8} {T['adicionales']})"
 
     comp_data = [
-        [Paragraph("<b>Aplicaciones SAP:</b>", table_cell_bold), Paragraph(apps_str, table_cell_style)],
-        [Paragraph("<b>Origenes IP Muestreados:</b>", table_cell_bold), Paragraph(ips_str, table_cell_style)],
+        [Paragraph(f"<b>{T['apps_sap']}</b>", table_cell_bold), Paragraph(apps_str, table_cell_style)],
+        [Paragraph(f"<b>{T['ips_muestreados']}</b>", table_cell_bold), Paragraph(ips_str, table_cell_style)],
     ]
     t_comp = Table(comp_data, colWidths=[130, 400])
     t_comp.setStyle(TableStyle([
@@ -276,7 +441,7 @@ def _append_incident_story(story: List[Any], postmortem_data: Dict[str, Any], st
     story.append(t_comp)
     story.append(Spacer(1, 6))
 
-    story.append(Paragraph("4. Analisis de Causa Raiz y Evidencia Forense de Logs", sec_title_style))
+    story.append(Paragraph(T['s4'], sec_title_style))
 
     reporte_md = postmortem_data.get('reporte_markdown', '') or ''
     p_seccion4 = ""
@@ -290,13 +455,13 @@ def _append_incident_story(story: List[Any], postmortem_data: Dict[str, Any], st
         if l_str and not l_str.startswith('|') and not l_str.startswith('#'):
             lineas_limpias.append(_md_to_reportlab(l_str))
 
-    analisis_txt = "<br/>".join(lineas_limpias) if lineas_limpias else "Analisis pericial basado en telemetria correlacionada."
+    analisis_txt = "<br/>".join(lineas_limpias) if lineas_limpias else T['analisis_def']
     story.append(Paragraph(analisis_txt, body_style))
     story.append(Spacer(1, 4))
 
     logs_raw_sample = meta.get('evidence_logs_sample', []) or meta.get('raw_evidence', {}).get('logs_muestra', [])
     if logs_raw_sample:
-        story.append(Paragraph("<b>Muestra de Evidencia en Logs Crudos (MCP Sample):</b>", st['sub_title']))
+        story.append(Paragraph(f"<b>{T['muestra_logs']}</b>", st['sub_title']))
         log_lines = []
         for item in logs_raw_sample[:4]:
             ts = item.get('TIMESTAMP', 'N/A')
@@ -324,7 +489,7 @@ def _append_incident_story(story: List[Any], postmortem_data: Dict[str, Any], st
         story.append(t_box)
         story.append(Spacer(1, 6))
 
-    story.append(Paragraph("5. Plan de Mitigacion y Recomendaciones de Hardening", sec_title_style))
+    story.append(Paragraph(T['s5'], sec_title_style))
 
     p_seccion5 = ""
     if "## 5." in reporte_md:
@@ -339,12 +504,7 @@ def _append_incident_story(story: List[Any], postmortem_data: Dict[str, Any], st
             break
 
     if not mitigaciones:
-        mitigaciones = [
-            "1. <b>Contencion Inmediata:</b> Aislamiento de sesiones activas y bloqueo de rangos IP anomalos en WAF.",
-            "2. <b>Rate Limiting y Timeouts:</b> Restriccion temporal de concurrencia sobre los endpoints afectados.",
-            "3. <b>Revision de Autorizaciones:</b> Auditoria estricta de politicas RBAC y llamadas a herramientas del LLM.",
-            "4. <b>Monitoreo Reforzado:</b> Calibracion continua del Isolation Forest para deteccion temprana de recurrencias."
-        ]
+        mitigaciones = list(T['mitig_def'])
 
     items_tabla = [[Paragraph(m, body_style)] for m in mitigaciones]
     t_mitiga = Table(items_tabla, colWidths=[540])
@@ -359,9 +519,10 @@ def _append_incident_story(story: List[Any], postmortem_data: Dict[str, Any], st
     story.append(t_mitiga)
 
 
-def generar_pdf_postmortem(postmortem_data: Dict[str, Any], output_path: Any):
+def generar_pdf_postmortem(postmortem_data: Dict[str, Any], output_path: Any, idioma: str = 'es'):
     """
     Compila el reporte estructurado de un incidente en un documento PDF ejecutivo.
+    idioma: 'es' o 'en' (textos fijos del PDF; el contenido llega ya en ese idioma).
     """
     doc = SimpleDocTemplate(
         output_path,
@@ -373,17 +534,18 @@ def generar_pdf_postmortem(postmortem_data: Dict[str, Any], output_path: Any):
     )
     st = _build_styles()
     story: List[Any] = []
-    _append_incident_story(story, postmortem_data, st)
-    doc.build(story, canvasmaker=NumberedCanvas)
+    _append_incident_story(story, postmortem_data, st, idioma)
+    doc.build(story, canvasmaker=partial(NumberedCanvas, idioma=idioma))
 
 
-def _clasificar_severidad_incidente(z_max: float, severidad_score: float = 0.0):
+def _clasificar_severidad_incidente(z_max: float, severidad_score: float = 0.0, idioma: str = 'es'):
     """Clasifica cualitativamente la severidad del incidente con color corporativo para tablas PDF."""
+    critico, grave, moderado = _tx(idioma)['sev']
     if z_max >= 20.0 or severidad_score >= 0.82:
-        return "Crítico", "#B42318", colors.HexColor("#FEE4E2")
+        return critico, "#B42318", colors.HexColor("#FEE4E2")
     if z_max >= 10.0 or severidad_score >= 0.74:
-        return "Grave", "#B54708", colors.HexColor("#FEF3C7")
-    return "Moderado", "#0057D2", colors.HexColor("#E0F2FE")
+        return grave, "#B54708", colors.HexColor("#FEF3C7")
+    return moderado, "#0057D2", colors.HexColor("#E0F2FE")
 
 
 def _extraer_causa_raiz_breve(reporte_md: str) -> str:
@@ -400,7 +562,8 @@ def _extraer_causa_raiz_breve(reporte_md: str) -> str:
             continue
         limpio = s.replace("**", "").replace("`", "")
         limpio = re.sub(
-            r'^(?:4\.\s*)?(?:An[aá]lisis\s+Forense\s+de\s+Causa\s+Ra[ií]z\s+y\s+Evidencia(?:\s*\(Root\s+Cause\))?)[:\.\-\s]*',
+            r'^(?:4\.\s*)?(?:An[aá]lisis\s+Forense\s+de\s+Causa\s+Ra[ií]z\s+y\s+Evidencia(?:\s*\(Root\s+Cause\))?'
+            r'|Forensic\s+Root\s+Cause\s+Analysis\s+and\s+Evidence(?:\s*\(Root\s+Cause\))?)[:\.\-\s]*',
             '',
             limpio,
             flags=re.IGNORECASE,
@@ -416,7 +579,8 @@ def _extraer_causa_raiz_breve(reporte_md: str) -> str:
     return txt
 
 
-def generar_pdf_postmortem_mensual(postmortems: List[Dict[str, Any]], periodo: str, output_path: Any):
+def generar_pdf_postmortem_mensual(postmortems: List[Dict[str, Any]], periodo: str, output_path: Any,
+                                   idioma: str = 'es'):
     """
     Compila un Dossier Forense Mensual Unificado (~5-8 paginas) estilo SAP SOC:
       1. Resumen Ejecutivo Consolidado y Distribucion por Campana / Vector MITRE
@@ -434,6 +598,7 @@ def generar_pdf_postmortem_mensual(postmortems: List[Dict[str, Any]], periodo: s
         bottomMargin=42,
     )
     st = _build_styles()
+    T = _tx(idioma)
     story: List[Any] = []
 
     ordenados = sorted(
@@ -458,20 +623,20 @@ def generar_pdf_postmortem_mensual(postmortems: List[Dict[str, Any]], periodo: s
     # -------------------------------------------------------------------------
     header_data = [
         [
-            Paragraph(f"DOSSIER FORENSE POSTMORTEM MENSUAL: {_md_to_reportlab(periodo)}", st['title']),
+            Paragraph(f"{T['m_titulo']}: {_md_to_reportlab(periodo)}", st['title']),
             Paragraph(
-                f"<b>INCIDENTES UNICOS:</b> {n_total}<br/>"
-                f"<b>TACTICAS MITRE:</b> {len(tacticas_set)}",
+                f"<b>{T['m_incidentes']}:</b> {n_total}<br/>"
+                f"<b>{T['m_tacticas']}:</b> {len(tacticas_set)}",
                 st['cell_bold'],
             ),
         ],
         [
             Paragraph(
-                f"<b>Cobertura Temporal:</b> {_md_to_reportlab(ini_mes)} &rarr; {_md_to_reportlab(fin_mes)} UTC &nbsp;|&nbsp; "
-                f"<b>Corrientes:</b> SYSTEM ({n_sys}) / LLM ({n_llm})",
+                f"<b>{T['m_cobertura']}:</b> {_md_to_reportlab(ini_mes)} &rarr; {_md_to_reportlab(fin_mes)} UTC &nbsp;|&nbsp; "
+                f"<b>{T['m_corrientes']}:</b> SYSTEM ({n_sys}) / LLM ({n_llm})",
                 st['meta'],
             ),
-            Paragraph(f"<b>Apps SAP:</b> {len(apps_all)} &nbsp;|&nbsp; <b>IPs:</b> {len(ips_all)}", st['meta']),
+            Paragraph(f"<b>{T['m_apps']}:</b> {len(apps_all)} &nbsp;|&nbsp; <b>IPs:</b> {len(ips_all)}", st['meta']),
         ],
     ]
     t_hdr = Table(header_data, colWidths=[410, 130])
@@ -487,7 +652,7 @@ def generar_pdf_postmortem_mensual(postmortems: List[Dict[str, Any]], periodo: s
     # -------------------------------------------------------------------------
     # SECCION 1: RESUMEN EJECUTIVO Y PANORAMA DE CAMPANAS DEL MES
     # -------------------------------------------------------------------------
-    story.append(Paragraph("1. Resumen Ejecutivo Consolidado y Panorama de Amenazas del Mes", st['sec_title']))
+    story.append(Paragraph(T['m_s1'], st['sec_title']))
 
     # Agrupar por vector de ataque (campana)
     por_vector: Dict[str, List[Dict[str, Any]]] = {}
@@ -497,17 +662,11 @@ def generar_pdf_postmortem_mensual(postmortems: List[Dict[str, Any]], periodo: s
     campanas_ordenadas = sorted(por_vector.items(), key=lambda kv: (-len(kv[1]), kv[0]))
     resumen_campanas_txt = ", ".join(f"<b>{_md_to_reportlab(v)}</b> ({len(lista)})" for v, lista in campanas_ordenadas)
 
-    dictamen_mes = (
-        f"Durante el periodo <b>{_md_to_reportlab(periodo)}</b> ({_md_to_reportlab(ini_mes)} a {_md_to_reportlab(fin_mes)} UTC), "
-        f"el pipeline de observabilidad con Isolation Forest en SAP HANA Cloud y el Agente Forense MCP correlacionaron "
-        f"<b>{n_total}</b> incidentes relevantes unicos tras deduplicacion multi-escala (5min, 15min, 30min, 1h y 3h): "
-        f"<b>{n_sys}</b> sobre infraestructura y aplicaciones core SAP (stream SYSTEM) y <b>{n_llm}</b> sobre "
-        f"servicios de inferencia de IA generativa (stream LLM). "
-        f"La actividad maliciosa y anomala se agrupo en <b>{len(campanas_ordenadas)}</b> familias de amenaza: "
-        f"{resumen_campanas_txt}, mapeadas a <b>{len(tacticas_set)}</b> tactica(s) MITRE ATT&amp;CK / ATLAS e "
-        f"impactando un total de <b>{len(apps_all)}</b> aplicacion(es) SAP y <b>{len(ips_all)}</b> origen(es) IP unicos."
-    )
-    t_dict = Table([[Paragraph(f"<b>Dictamen Forense Consolidado del Periodo:</b> {dictamen_mes}", st['exec_summary'])]], colWidths=[540])
+    dictamen_mes = T['m_dictamen'].format(
+        periodo=_md_to_reportlab(periodo), ini=_md_to_reportlab(ini_mes), fin=_md_to_reportlab(fin_mes),
+        n=n_total, n_sys=n_sys, n_llm=n_llm, n_fam=len(campanas_ordenadas), fams=resumen_campanas_txt,
+        n_tac=len(tacticas_set), n_apps=len(apps_all), n_ips=len(ips_all))
+    t_dict = Table([[Paragraph(f"<b>{T['m_dictamen_tit']}</b> {dictamen_mes}", st['exec_summary'])]], colWidths=[540])
     t_dict.setStyle(TableStyle([
         ('BACKGROUND', (0, 0), (-1, -1), colors.HexColor('#F0F7FF')),
         ('BOX', (0, 0), (-1, -1), 0.5, colors.HexColor('#BAE6FD')),
@@ -521,15 +680,7 @@ def generar_pdf_postmortem_mensual(postmortems: List[Dict[str, Any]], periodo: s
 
     # Tabla 1B: Sintesis por Campana / Vector de Ataque
     orden_esc = {'5min': 1, '15min': 2, '30min': 3, '1h': 4, '3h': 5}
-    camp_rows = [[
-        Paragraph("Campana / Vector", st['cell_bold']),
-        Paragraph("Stream", st['cell_bold']),
-        Paragraph("Tactica y Tecnica MITRE", st['cell_bold']),
-        Paragraph("Inc.", st['cell_bold']),
-        Paragraph("Escalas Detectadas", st['cell_bold']),
-        Paragraph("Indicador Dominante (Z-Max)", st['cell_bold']),
-        Paragraph("Servicios SAP Impactados", st['cell_bold']),
-    ]]
+    camp_rows = [[Paragraph(c, st['cell_bold']) for c in T['m_camp_cols']]]
     for vec, lista in campanas_ordenadas:
         st_vec = ", ".join(sorted({str(x.get('stream', '')).upper() for x in lista}))
         mitre_vec = str(lista[0].get('mitre_tactic', 'N/A'))
@@ -561,7 +712,7 @@ def generar_pdf_postmortem_mensual(postmortems: List[Dict[str, Any]], periodo: s
             Paragraph(f"<b>{len(lista)}</b>", st['cell']),
             Paragraph(_md_to_reportlab(", ".join(esc_ordenadas)), st['cell']),
             Paragraph(_md_to_reportlab(f"{best_feat} (Z={best_z:.1f})"), st['cell']),
-            Paragraph(_md_to_reportlab(apps_vec_str or "Plataforma SAP"), st['cell']),
+            Paragraph(_md_to_reportlab(apps_vec_str or T['m_plataforma']), st['cell']),
         ])
 
     t_camp = Table(camp_rows, colWidths=[78, 46, 104, 28, 66, 98, 120])
@@ -579,13 +730,8 @@ def generar_pdf_postmortem_mensual(postmortems: List[Dict[str, Any]], periodo: s
     # -------------------------------------------------------------------------
     # SECCION 2: CRONOLOGIA MAESTRA DE INCIDENTES MULTI-ESCALA DEL PERIODO
     # -------------------------------------------------------------------------
-    story.append(Paragraph("2. Cronologia Maestra de Incidentes Multi-Escala del Periodo", st['sec_title']))
-    matriz_rows = [[
-        Paragraph("Expediente", st['cell_bold']),
-        Paragraph("Origen", st['cell_bold']),
-        Paragraph("Vector / Ataque", st['cell_bold']),
-        Paragraph("Ventana Temporal (UTC)", st['cell_bold']),
-    ]]
+    story.append(Paragraph(T['m_s2'], st['sec_title']))
+    matriz_rows = [[Paragraph(c, st['cell_bold']) for c in T['m_crono_cols']]]
     for p in ordenados:
         ini_s = str(p.get('inicio', 'N/A'))[:16]
         fin_s = str(p.get('fin', 'N/A'))
@@ -613,13 +759,8 @@ def generar_pdf_postmortem_mensual(postmortems: List[Dict[str, Any]], periodo: s
     # -------------------------------------------------------------------------
     # SECCION 3: ANALISIS FORENSE UNIFICADO POR FAMILIA / CAMPANA DE AMENAZA
     # -------------------------------------------------------------------------
-    story.append(Paragraph("3. Analisis Forense Unificado por Familia de Amenaza y Evidencia MCP", st['sec_title']))
-    story.append(Paragraph(
-        "A continuacion se consolida el analisis pericial de causa raiz, las sintesis ejecutivas redactadas "
-        "por Gemini para cada incidente y las muestras representativas de logs crudos extraidos via MCP desde "
-        "SAP HANA Cloud, agrupados por vector de ataque para eliminar redundancia operativa.",
-        st['body'],
-    ))
+    story.append(Paragraph(T['m_s3'], st['sec_title']))
+    story.append(Paragraph(T['m_s3_intro'], st['body']))
     story.append(Spacer(1, 4))
 
     cell_center_bold = ParagraphStyle(
@@ -651,8 +792,8 @@ def generar_pdf_postmortem_mensual(postmortems: List[Dict[str, Any]], periodo: s
 
         # Sub-encabezado de la Campana
         story.append(Paragraph(
-            f"3.{idx_c} Campana: {_md_to_reportlab(vec)} ({len(lista)} incidente(s) | Stream: {_md_to_reportlab(st_vec)} | "
-            f"Escalas: {_md_to_reportlab(', '.join(esc_camp))})",
+            T['m_campana'].format(i=idx_c, v=_md_to_reportlab(vec), n=len(lista), s=_md_to_reportlab(st_vec),
+                                  e=_md_to_reportlab(', '.join(esc_camp))),
             st['sub_title'],
         ))
 
@@ -664,24 +805,24 @@ def generar_pdf_postmortem_mensual(postmortems: List[Dict[str, Any]], periodo: s
                 causa_principal = c_breve
                 break
         if not causa_principal:
-            causa_principal = str(lista[0].get('resumen_ejecutivo') or 'Patron anomalo detectado por Isolation Forest.')
+            causa_principal = str(lista[0].get('resumen_ejecutivo') or T['m_patron_def'])
 
-        ips_muestra_txt = ", ".join(ips_camp[:10]) + (f" (+{len(ips_camp) - 10} adicionales)" if len(ips_camp) > 10 else "")
+        ips_muestra_txt = ", ".join(ips_camp[:10]) + (f" (+{len(ips_camp) - 10} {T['adicionales']})" if len(ips_camp) > 10 else "")
         resumen_camp_rows = [
             [
-                Paragraph("<b>Marco MITRE:</b>", st['cell_bold']),
+                Paragraph(f"<b>{T['m_marco']}</b>", st['cell_bold']),
                 Paragraph(_md_to_reportlab(f"{mitre_t} — {mitre_tech}" if mitre_tech else mitre_t), st['cell']),
             ],
             [
-                Paragraph("<b>Aplicaciones SAP:</b>", st['cell_bold']),
-                Paragraph(_md_to_reportlab(", ".join(apps_camp) or "Servicios internos SAP"), st['cell']),
+                Paragraph(f"<b>{T['m_apps_sap']}</b>", st['cell_bold']),
+                Paragraph(_md_to_reportlab(", ".join(apps_camp) or T['m_apps_def']), st['cell']),
             ],
             [
-                Paragraph("<b>IPs Involucradas:</b>", st['cell_bold']),
-                Paragraph(_md_to_reportlab(ips_muestra_txt or "Trafico interno / Gateway proxy"), st['cell']),
+                Paragraph(f"<b>{T['m_ips']}</b>", st['cell_bold']),
+                Paragraph(_md_to_reportlab(ips_muestra_txt or T['ips_def']), st['cell']),
             ],
             [
-                Paragraph("<b>Mecanismo y Causa Raiz:</b>", st['cell_bold']),
+                Paragraph(f"<b>{T['m_causa']}</b>", st['cell_bold']),
                 Paragraph(_md_to_reportlab(causa_principal), st['cell']),
             ],
         ]
@@ -699,9 +840,9 @@ def generar_pdf_postmortem_mensual(postmortems: List[Dict[str, Any]], periodo: s
 
         # Tabla compacta con el desglose de cada incidente dentro de esta campana
         inc_rows = [[
-            Paragraph("Expediente y Ventana (UTC)", st['cell_bold']),
-            Paragraph("Severidad", cell_center_bold),
-            Paragraph("Hallazgo Forense Puntual (Sintesis Gemini)", st['cell_bold']),
+            Paragraph(T['m_inc_cols'][0], st['cell_bold']),
+            Paragraph(T['m_inc_cols'][1], cell_center_bold),
+            Paragraph(T['m_inc_cols'][2], st['cell_bold']),
         ]]
         inc_table_styles = [
             ('BACKGROUND', (0, 0), (-1, 0), colors.HexColor('#F0F7FF')),
@@ -717,7 +858,7 @@ def generar_pdf_postmortem_mensual(postmortems: List[Dict[str, Any]], periodo: s
             incx = mx.get('incident_meta') or {}
             zv_x = float(incx.get('z_max') or 0.0)
             sev_s = float(x.get('severidad_score') or 0.0)
-            sev_lbl, sev_fg, sev_bg = _clasificar_severidad_incidente(zv_x, sev_s)
+            sev_lbl, sev_fg, sev_bg = _clasificar_severidad_incidente(zv_x, sev_s, idioma)
             inc_table_styles.append(('BACKGROUND', (1, row_idx), (1, row_idx), sev_bg))
             ini_x = str(x.get('inicio', 'N/A'))[:16]
             fin_x = str(x.get('fin', 'N/A'))[:16]
@@ -773,7 +914,7 @@ def generar_pdf_postmortem_mensual(postmortems: List[Dict[str, Any]], periodo: s
 
         if log_lines:
             story.append(Spacer(1, 2))
-            txt_logs = "Evidencia MCP (Logs Crudos):\n" + "\n".join(log_lines)
+            txt_logs = T['m_evidencia'] + "\n" + "\n".join(log_lines)
             safe_logs = txt_logs.replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;').replace('\n', '<br/>')
             t_box = Table([[Paragraph(safe_logs, st['code_box'])]], colWidths=[540])
             t_box.setStyle(TableStyle([
@@ -790,15 +931,10 @@ def generar_pdf_postmortem_mensual(postmortems: List[Dict[str, Any]], periodo: s
     # -------------------------------------------------------------------------
     # SECCION 4: MATRIZ DE CORRELACION MULTI-ESCALA Y SUPERFICIE SAP
     # -------------------------------------------------------------------------
-    story.append(Paragraph("4. Correlacion Multi-Escala (5min a 3h) y Superficie de Impacto SAP", st['sec_title']))
+    story.append(Paragraph(T['m_s4'], st['sec_title']))
 
     todas_escalas = ['5min', '15min', '30min', '1h', '3h']
-    esc_stats_rows = [[
-        Paragraph("Longitud de Ventana", st['cell_bold']),
-        Paragraph("Incidentes Detectados", st['cell_bold']),
-        Paragraph("Exclusivos de esta Escala", st['cell_bold']),
-        Paragraph("Vectores Observados en la Escala", st['cell_bold']),
-    ]]
+    esc_stats_rows = [[Paragraph(c, st['cell_bold']) for c in T['m_esc_cols']]]
     for esc_name in todas_escalas:
         inc_en_esc = []
         exclusivos = []
@@ -815,9 +951,9 @@ def generar_pdf_postmortem_mensual(postmortems: List[Dict[str, Any]], periodo: s
         if inc_en_esc:
             esc_stats_rows.append([
                 Paragraph(f"<b>{_md_to_reportlab(esc_name)}</b>", st['cell']),
-                Paragraph(f"{len(inc_en_esc)} de {n_total}", st['cell']),
+                Paragraph(T['m_de'].format(a=len(inc_en_esc), b=n_total), st['cell']),
                 Paragraph(
-                    f"{len(exclusivos)} ({_md_to_reportlab(', '.join(exclusivos[:3]))})" if exclusivos else "0 (correlacionados)",
+                    f"{len(exclusivos)} ({_md_to_reportlab(', '.join(exclusivos[:3]))})" if exclusivos else T['m_correlacionados'],
                     st['cell'],
                 ),
                 Paragraph(_md_to_reportlab(", ".join(sorted(vecs_esc))), st['cell']),
@@ -843,15 +979,11 @@ def generar_pdf_postmortem_mensual(postmortems: List[Dict[str, Any]], periodo: s
             info['count'] += 1
             info['vectores'].add(str(p.get('tipo_ataque', 'N/A')))
     if app_map:
-        app_rows = [[
-            Paragraph("Aplicacion / Servicio SAP", st['cell_bold']),
-            Paragraph("Incidentes Asociados", st['cell_bold']),
-            Paragraph("Vectores de Amenaza Observados sobre el Activo", st['cell_bold']),
-        ]]
+        app_rows = [[Paragraph(c, st['cell_bold']) for c in T['m_app_cols']]]
         for app_name, info in sorted(app_map.items(), key=lambda kv: (-kv[1]['count'], kv[0])):
             app_rows.append([
                 Paragraph(f"<b>{_md_to_reportlab(app_name)}</b>", st['cell']),
-                Paragraph(f"{info['count']} incidente(s)", st['cell']),
+                Paragraph(T['m_incidentes_n'].format(n=info['count']), st['cell']),
                 Paragraph(_md_to_reportlab(", ".join(sorted(info['vectores']))), st['cell']),
             ])
         t_apps = Table(app_rows, colWidths=[150, 95, 295])
@@ -869,7 +1001,7 @@ def generar_pdf_postmortem_mensual(postmortems: List[Dict[str, Any]], periodo: s
     # -------------------------------------------------------------------------
     # SECCION 5: PLAN MAESTRO CONSOLIDADO DE CONTENCION Y HARDENING DEL MES
     # -------------------------------------------------------------------------
-    story.append(Paragraph("5. Plan Maestro Consolidado de Contencion y Hardening del Mes", st['sec_title']))
+    story.append(Paragraph(T['m_s5'], st['sec_title']))
     acciones_por_camp = []
     for vec, lista in campanas_ordenadas:
         acciones_vec = []
@@ -892,11 +1024,7 @@ def generar_pdf_postmortem_mensual(postmortems: List[Dict[str, Any]], periodo: s
             )
 
     if not acciones_por_camp:
-        acciones_por_camp = [
-            "<b>[Proteccion Perimetral y WAF]:</b> Bloqueo automatizado de rangos IP anomalos y rate-limiting dinamico por endpoint SAP.",
-            "<b>[Seguridad de Identidad y Contexto SAP]:</b> Enforzar MFA, rotacion de sesiones y validacion estricta de cabeceras y payloads.",
-            "<b>[Guardrails de IA Generativa / LLM]:</b> Aislar directivas de sistema, filtrar Prompt Injection y limitar cuotas de tokens por SERVICE_ID.",
-        ]
+        acciones_por_camp = list(T['m_acciones_def'])
 
     t_act = Table([[Paragraph(a, st['body'])] for a in acciones_por_camp], colWidths=[540])
     t_act.setStyle(TableStyle([
@@ -909,4 +1037,4 @@ def generar_pdf_postmortem_mensual(postmortems: List[Dict[str, Any]], periodo: s
     ]))
     story.append(t_act)
 
-    doc.build(story, canvasmaker=NumberedCanvas)
+    doc.build(story, canvasmaker=partial(NumberedCanvas, idioma=idioma))
