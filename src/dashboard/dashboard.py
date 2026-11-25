@@ -64,8 +64,8 @@ def conf_txt(c):
 # Modularización
 from tema import (BRAND, NAVY, GOLD, SERIES, INK, INK2, MUTED, GRID, AXIS, NEUTRO, SURFACE,
                   CARD_BORDER, PAGE, DIV_MID, CRITICO, AZUL_SEQ, CONFIANZA_COLOR)
-from datos_hana import _conn, leer, leer_postmortems, _parse_json_safe
-from health import estados_hc, inventario_hana, metricas_pipeline, vista_health
+from datos_hana import _conn, reiniciar_conexion, leer, leer_postmortems, _parse_json_safe
+from health import estados_hc, inventario_hana, metricas_pipeline, vista_health, _es_hana_apagada
 
 def _declarar_grafica_rango():
     """
@@ -655,15 +655,74 @@ def perfil_relevantes(win, rel, familias):
     return p.set_index("EVENTO_ID")[list(familias)]
 
 
-# Barra lateral
+# Barra lateral y compuerta de disponibilidad de SAP HANA Cloud
+_hana_error = None
 try:
     meses = meses_disponibles()
-except Exception as e:  # sin conexión no hay nada que mostrar
-    st.error(tr("No fue posible conectarse a SAP HANA. Revisa la configuración de conexión.",
-                "Could not connect to SAP HANA. Check the connection settings.") + f"\n\n{e}")
-    st.stop()
-if not meses:
-    st.warning(tr("Todavía no hay resultados cargados en SAP HANA.", "There are no results loaded in SAP HANA yet."))
+except Exception as e:
+    meses = []
+    _hana_error = str(e)
+
+if _hana_error or not meses:
+    _apagada = _es_hana_apagada(_hana_error) if _hana_error else False
+    _estado_pill = (
+        tr("Apagada", "Stopped") if _apagada else
+        tr("Sin conexión", "Offline") if _hana_error else
+        tr("Sin resultados", "No results")
+    )
+    with st.sidebar:
+        st.segmented_control(
+            "Idioma / Language", ["es", "en"], default="es", key="idioma",
+            format_func={"es": "Español", "en": "English"}.get, width="stretch",
+            label_visibility="collapsed",
+        )
+        st.html(tr(
+            '<div class="side-brand">Anomalías <span>SAP</span></div>'
+            '<div class="side-sub">Monitoreo de comportamiento inusual en los registros de SAP</div>',
+            '<div class="side-brand"><span>SAP</span> Anomalies</div>'
+            '<div class="side-sub">Monitoring unusual behavior in SAP logs</div>',
+        ))
+        if _apagada:
+            st.error(tr(
+                "Instancia SAP HANA Cloud apagada. Enciéndela desde SAP HANA Cloud Central.",
+                "SAP HANA Cloud instance is stopped. Start it from SAP HANA Cloud Central.",
+            ))
+        elif _hana_error:
+            st.error(tr(
+                "No se pudo conectar a SAP HANA Cloud.",
+                "Could not connect to SAP HANA Cloud.",
+            ))
+        else:
+            st.warning(tr(
+                "Aún no hay tablas RESULT_* en SAP HANA Cloud.",
+                "No RESULT_* tables found in SAP HANA Cloud yet.",
+            ))
+        st.caption(tr(
+            "Las demás secciones permanecen bloqueadas hasta restablecer la conexión con SAP HANA Cloud.",
+            "Other views stay locked until the SAP HANA Cloud connection is restored.",
+        ))
+        if st.button(tr("Reintentar conexión", "Retry connection"), icon=":material/refresh:",
+                     type="primary", width="stretch", key="offline_retry_btn"):
+            reiniciar_conexion()
+            st.cache_data.clear()
+            st.rerun()
+
+    def _pagina_health_offline():
+        encabezado(
+            "Health Check",
+            tr("Diagnóstico del sistema", "System health check"),
+            tr(
+                "Verificación en vivo de SAP HANA Cloud y del resto de servicios de la plataforma.",
+                "Live verification of SAP HANA Cloud and all other platform services.",
+            ),
+            pills=[("SAP HANA Cloud", _estado_pill)],
+            con_periodo=False,
+        )
+        vista_health(tarjeta, estilo, mostrar, hana_error=_hana_error)
+
+    pg_offline = st.Page(_pagina_health_offline, title="Health Check", icon=":material/monitor_heart:",
+                         url_path="health", default=True)
+    st.navigation([pg_offline], position="top").run()
     st.stop()
 
 with st.sidebar:

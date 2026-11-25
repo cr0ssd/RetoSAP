@@ -15,6 +15,11 @@ def _crear_conexion():
     return hana_df.ConnectionContext(**_params(), communicationTimeout=120000)
 
 
+def reiniciar_conexion():
+    """Limpia la conexion en cache para forzar una reconexion limpia con SAP HANA."""
+    _crear_conexion.clear()
+
+
 def _conn():
     """Conexión guardada entre recargas; si dejó de responder (p. ej. tras horas sin uso), se rehace."""
     c = _crear_conexion()

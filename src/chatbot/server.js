@@ -26,7 +26,7 @@ const ai = new GoogleGenAI({
   apiKey: process.env.GEMINI_API_KEY,
   httpOptions: { timeout: GEMINI_TIMEOUT_MS },
 });
-const PORT = process.env.PORT || 3000;
+const PORT = process.env.CHATBOT_PORT || process.env.PORT || 3000;
 const MAX_MESSAGE_LENGTH = 1000;
 const MAX_CONTEXT_LENGTH = 120000;
 const MAX_SESSIONS = 200;
@@ -98,6 +98,10 @@ function getChat(sessionId, context, language) {
   sessions.set(sessionId, { key, chat });
   return chat;
 }
+
+app.get("/health", (_req, res) => {
+  res.json({ ok: true, service: "sapy-chatbot", model: MODEL });
+});
 
 app.post("/api/chat", async (req, res) => {
   try {
