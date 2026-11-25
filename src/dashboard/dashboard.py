@@ -1,3 +1,4 @@
+import base64
 import html
 import io
 import json
@@ -90,33 +91,32 @@ def _declarar_grafica_rango():
 grafica_rango = _declarar_grafica_rango()
 
 _FORESTIA_FAVICON = DASHBOARD_DIR / "componentes" / "forestia_favicon.png"
-_FORESTIA_ICON_SVG_INLINE = """
-<svg viewBox="0 0 1000 1040" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="forestia">
-  <polygon points="500,70 750,230 250,230" fill="currentColor"/>
-  <circle cx="500" cy="327" r="41" fill="currentColor"/>
-  <path fill="currentColor" fill-rule="evenodd" d="
-    M 330 230 L 670 230 L 670 422 L 775 527 L 712 527 L 834 690 L 713 690 L 889 889
-    L 612 889 L 612 1003 L 542 1003 L 542 813 L 731 813 L 563 621 L 702 621 L 610 498
-    L 390 498 L 298 621 L 437 621 L 269 813 L 458 813 L 458 1003 L 388 1003 L 388 889
-    L 111 889 L 287 690 L 166 690 L 288 527 L 225 527 L 330 422 Z
-    M 390 230 L 390 422 L 610 422 L 610 230 Z
-  "/>
-</svg>
-""".strip()
+_FORESTIA_ICON_PNG = DASHBOARD_DIR / "componentes" / "forestia_icon.png"
+_FORESTIA_ICON_B64 = (
+    base64.b64encode(_FORESTIA_ICON_PNG.read_bytes()).decode("ascii")
+    if _FORESTIA_ICON_PNG.exists()
+    else ""
+)
 
 
-def _sidebar_brand_html() -> str:
+def _render_sidebar_brand() -> None:
     """Renderiza el encabezado de marca Forestia en la barra lateral."""
     sub = tr(
         "Monitoreo de comportamiento inusual en los registros de SAP",
         "Monitoring unusual behavior in SAP logs",
     )
-    return (
+    icon_html = (
+        f'<img src="data:image/png;base64,{_FORESTIA_ICON_B64}" alt="forestia icon" class="side-brand-icon" />'
+        if _FORESTIA_ICON_B64
+        else ""
+    )
+    st.markdown(
         f'<div class="side-brand" aria-label="forestia">'
-        f'{_FORESTIA_ICON_SVG_INLINE}'
+        f'{icon_html}'
         f'<span class="side-brand-word">forestia</span>'
         f'</div>'
-        f'<div class="side-sub">{sub}</div>'
+        f'<div class="side-sub">{sub}</div>',
+        unsafe_allow_html=True,
     )
 
 
@@ -292,7 +292,7 @@ st.html(f"""
       border-bottom: 1px solid {CARD_BORDER}; box-shadow: 0 1px 3px rgba(34,53,72,.06); }}
   [data-testid="stSidebar"] {{ border-right: 1px solid {CARD_BORDER}; }}
   .side-brand {{ display: flex; align-items: center; gap: .48rem; margin: .15rem 0 .25rem; color: {INK}; }}
-  .side-brand svg {{ width: 32px; height: 34px; flex-shrink: 0; display: block; color: {INK}; }}
+  .side-brand-icon {{ width: 34px; height: 34px; flex-shrink: 0; display: block; object-fit: contain; }}
   .side-brand-word {{
       font-family: "Helvetica Neue", Helvetica, Arial, sans-serif;
       font-size: 1.72rem; font-weight: 700; letter-spacing: -0.025em;
@@ -718,7 +718,7 @@ if _hana_error or not meses:
             format_func={"es": "Español", "en": "English"}.get, width="stretch",
             label_visibility="collapsed",
         )
-        st.html(_sidebar_brand_html())
+        _render_sidebar_brand()
         if _apagada:
             st.error(tr(
                 "Instancia SAP HANA Cloud apagada. Enciéndela desde SAP HANA Cloud Central.",
@@ -766,7 +766,7 @@ with st.sidebar:
     st.segmented_control("Idioma / Language", ["es", "en"], default="es", key="idioma",
                          format_func={"es": "Español", "en": "English"}.get, width="stretch",
                          label_visibility="collapsed")
-    st.html(_sidebar_brand_html())
+    _render_sidebar_brand()
     MES = st.selectbox(tr("Periodo", "Period"), meses, format_func=lambda m: m.replace("_", "-"), key="mes")
     eventos_all = leer("EVENTS", MES)
     resumen_all = leer("SUMMARY", MES)
