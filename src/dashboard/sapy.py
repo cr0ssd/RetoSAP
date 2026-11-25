@@ -1,26 +1,218 @@
 import base64
+import json
+import os
 import time
+import urllib.error
+import urllib.request
 from pathlib import Path
+from uuid import uuid4
 
+import pandas as pd
 import streamlit as st
 
 DIR = Path(__file__).resolve().parent
 AVATAR = DIR / "componentes" / "sapy.png"
 
-
-# ---------------------------------------------------------------------------
-# Lógica del chatbot: POR IMPLEMENTAR
-# ---------------------------------------------------------------------------
-def responder(historial, pregunta, idioma="es"):
-    time.sleep(0.6)     # simula el tiempo de respuesta para ver el indicador "Sapy está pensando…"
-    if idioma == "en":
-        return f"*(Sample answer)* I'm not connected yet. You asked: \"{pregunta}\""
-    return f"*(Respuesta de ejemplo)* Todavía no estoy conectado. Preguntaste: \"{pregunta}\""
+# Backend Node (src/chatbot/server.js)
+CHATBOT_URL = os.getenv("CHATBOT_URL", "http://localhost:3000/api/chat")
+CHATBOT_TIMEOUT = 45        # segundos; el servidor corta a Gemini a los 30 s, así que siempre responde antes
 
 
-# ---------------------------------------------------------------------------
+# Lo que Sapy sabe: guía fija del dashboard (sapy_guia.md) + los datos que se están viendo
+GUIA = DIR / "sapy_guia.md"
+MAX_EVENTOS, MAX_POSTMORTEMS = 40, 30
+
+
+def _txt(valor, limite):
+    if valor is None or (not isinstance(valor, (list, tuple, dict)) and pd.isna(valor)):
+        return ""
+    return " ".join(str(valor).split())[:limite]
+
+
+def _fecha(valor):
+    return "" if pd.isna(valor) else pd.Timestamp(valor).strftime("%Y-%m-%d %H:%M")
+
+
+def _meta(raw):
+    """METADATA_JSON de un postmortem -> dict (vacío si no se puede leer)."""
+    try:
+        d = raw if isinstance(raw, dict) else json.loads(str(raw))
+        return d if isinstance(d, dict) else {}
+    except Exception:
+        return {}
+
+
+def _sec_guia(d):
+    texto = GUIA.read_text(encoding="utf-8") if GUIA.exists() else ""
+    return "=== GUÍA DEL DASHBOARD ===\n" + texto.replace("{Z_UMBRAL}", f"{d['z_umbral']:g}")
+
+
+def _sec_tipos(d):
+    flecha = {"+": "aumenta", "-": "disminuye", "~": "cambia"}
+    lineas = ["=== TIPOS DE ATAQUE POSIBLES EN EL ORIGEN SELECCIONADO ==="]
+    for t in d["tipos"]:
+        senales = ", ".join(f"{d['nombre'](f)} {flecha[sg[t]]}" for f, sg in d["firma"].items() if t in sg)
+        desc = d["descripcion_tipo"].get(t, "")
+        lineas.append(f"- {d['tipo_txt'](t)}: {desc} Indicadores que lo señalan: {senales or 'n/d'}.")
+    return "\n".join(lineas)
+
+
+def _sec_estado(d):
+    win, ev, rel, res = d["ventanas"], d["eventos"], d["relevantes"], d["resumen"]
+    if d["periodo"]:
+        n_win, n_anom = len(win), int((win["LABEL"] == -1).sum())
+        n_ev, n_rel = len(ev), len(rel)
+        tipos = sorted(set(rel["TIPO_ATAQUE"].dropna()) - {"Falla operativa"})
+        alcance = f"del {d['periodo']} (periodo seleccionado con zoom)"
+    else:
+        n_win, n_anom = int(res["VENTANAS"].sum()), int(res["VENTANAS_ANOMALAS"].sum())
+        n_ev, n_rel = int(res["EVENTOS"].sum()), int(res["EVENTOS_RELEVANTES"].sum())
+        tipos = sorted({t.strip() for x in res["TIPOS_LISTA"].dropna() for t in x.split(",")} - {"Falla operativa"})
+        alcance = "del mes completo"
+    pct = f" ({n_anom / n_win:.1%} del total)" if n_win else ""
+    return "\n".join([
+        "=== ESTADO ACTUAL DEL DASHBOARD ===",
+        f"Mes: {d['mes']}. Origen de los registros: {d['origen']}. Intervalo de análisis: {d['intervalo']}.",
+        f"Alcance de los datos: {alcance}. Umbral de intensidad para un evento relevante: {d['z_umbral']:g}.",
+        f"Bloques analizados: {n_win:,}. Bloques atípicos: {n_anom:,}{pct}. Eventos detectados: {n_ev:,}. "
+        f"Eventos relevantes: {n_rel:,}.",
+        f"Tipos de ataque en eventos relevantes (sin contar Falla operativa): "
+        f"{', '.join(d['tipo_txt'](t) for t in tipos) or 'ninguno'}.",
+    ])
+
+
+def _sec_eventos(d):
+    ev, rel = d["eventos"], d["relevantes"]
+    if ev.empty:
+        return "=== EVENTOS ===\nNo hay eventos detectados con la selección actual."
+    top = rel.sort_values("Z_MAX", ascending=False).head(MAX_EVENTOS)
+    lineas = [f"=== EVENTOS RELEVANTES (más intensos primero; {len(top)} de {len(rel)}) ==="]
+    for _, r in top.iterrows():
+        lineas.append(
+            f"- Evento {int(r['EVENTO_ID'])} | tipo={d['tipo_txt'](r['TIPO_ATAQUE'])} | "
+            f"confianza={_txt(r.get('CONFIANZA'), 10)} | inicio={_fecha(r['INICIO'])} | "
+            f"fin={_fecha(r['FIN_REAL'])} | intensidad={r['Z_MAX']:.1f} | "
+            f"indicador más afectado={_txt(r.get('INDICADOR'), 60)} | cambios={_txt(r.get('CAMBIOS'), 160)}")
+    lineas.append(f"Eventos no relevantes: {len(ev) - len(rel)} (no se listan; son los de menor intensidad).")
+    return "\n".join(lineas)
+
+
+def _lista(valor, mostrar=8):
+    ##Lista guardada como JSON o CSV -> 'N elementos (a, b, c…)'.
+    if valor is None or (not isinstance(valor, (list, tuple)) and pd.isna(valor)):
+        return "0"
+    if isinstance(valor, (list, tuple)):
+        items = [str(x).strip() for x in valor]
+    else:
+        txt = str(valor).strip()
+        try:
+            cargado = json.loads(txt) if txt.startswith("[") else None
+        except Exception:
+            cargado = None
+        items = [str(x).strip() for x in cargado] if isinstance(cargado, list) else [x.strip() for x in txt.split(",")]
+    items = [x for x in dict.fromkeys(items) if x]
+    resto = f"… y {len(items) - mostrar} más" if len(items) > mostrar else ""
+    return f"{len(items)} ({', '.join(items[:mostrar])}{resto})" if items else "0"
+
+
+def _num(valor, decimales=2):
+    try:
+        return f"{float(valor):.{decimales}f}"
+    except (TypeError, ValueError):
+        return ""
+
+
+def _sec_postmortems(d):
+    df = d["postmortems"]
+    if df is None or df.empty:
+        return "=== POSTMORTEMS ===\nNo hay postmortems para el mes/periodo seleccionado."
+    df = df.sort_values("INICIO", ascending=False, na_position="last")
+    lineas = [f"=== POSTMORTEMS (reportes forenses; {min(len(df), MAX_POSTMORTEMS)} más recientes de {len(df)}) ===",
+              "La severidad es un puntaje: a mayor valor, más grave. El número de evento de un postmortem es el del "
+              "intervalo que aparece en su ID (p. ej. 30M = bloques de 30 min), que puede no coincidir con el "
+              "intervalo seleccionado en el dashboard; no lo confundas con los eventos de la lista anterior."]
+    for _, r in df.head(MAX_POSTMORTEMS).iterrows():
+        inc = _meta(r.get("METADATA_JSON")).get("incident_meta") or {}
+        z = inc.get("z_max")
+        lineas.append(
+            f"- {_txt(r.get('POSTMORTEM_ID'), 40)} | evento={_txt(r.get('EVENTO_ID'), 10)} | "
+            f"origen={_txt(r.get('STREAM'), 20)} | tipo={_txt(r.get('TIPO_ATAQUE'), 60)} | "
+            f"MITRE={_txt(r.get('MITRE_TACTIC'), 60)} | severidad={_num(r.get('SEVERIDAD_SCORE'))} | "
+            f"inicio={_fecha(r.get('INICIO'))} | fin={_fecha(r.get('FIN'))} | "
+            f"indicador={_txt(d['nombre'](str(inc.get('z_max_feature') or '')), 60)}"
+            f"{f' (Z={float(z):.1f})' if z else ''} | "
+            f"aplicaciones={_lista(r.get('APLICACIONES_AFECTADAS'))} | IPs={_lista(r.get('IPS_INVOLUCRADAS'))}\n"
+            f"  resumen: {_txt(r.get('RESUMEN_EJECUTIVO'), 400)}")
+    return "\n".join(lineas)
+
+
+def _sec_intervalos(d):
+    res = d["resumen_s"]
+    if res.empty:
+        return ""
+    g = (res.groupby(["WINDOW_SIZE_S", "WINDOW_LABEL"])[["EVENTOS", "EVENTOS_RELEVANTES"]].sum()
+         .reset_index().sort_values("WINDOW_SIZE_S"))
+    lineas = ["=== RESULTADOS SEGÚN EL INTERVALO DE ANÁLISIS (mes completo, origen seleccionado) ==="]
+    lineas += [f"- {r['WINDOW_LABEL']}: {int(r['EVENTOS'])} eventos, {int(r['EVENTOS_RELEVANTES'])} relevantes"
+               for _, r in g.iterrows()]
+    return "\n".join(lineas)
+
+
+def _sec_consistencia(d):
+    v = d["validacion"]
+    v = v[v["ESTADO"] == "evaluable"] if len(v) else v
+    if v.empty:
+        return ("=== CONSISTENCIA DE LA CLASIFICACIÓN ===\nNo hay datos suficientes para evaluarla en este "
+                "periodo (se necesitan al menos dos tipos de evento).")
+    g = (v.groupby(["WINDOW_SIZE_S", "WINDOW_LABEL"])[["ARI", "NMI"]].mean()
+         .reset_index().sort_values("WINDOW_SIZE_S"))
+    lineas = ["=== CONSISTENCIA DE LA CLASIFICACIÓN (promedio por intervalo; 1 = coincidencia total, 0 = azar) ==="]
+    lineas += [f"- {r['WINDOW_LABEL']}: ARI={r['ARI']:.2f}, NMI={r['NMI']:.2f}" for _, r in g.iterrows()]
+    return "\n".join(lineas)
+
+
+def construir_contexto(d):
+    """Texto completo que se envía a Gemini. Si una sección falla, se omite: el dashboard nunca se cae por Sapy."""
+    partes = []
+    for seccion in (_sec_guia, _sec_tipos, _sec_estado, _sec_eventos, _sec_postmortems,
+                    _sec_intervalos, _sec_consistencia):
+        try:
+            partes.append(seccion(d))
+        except Exception:
+            continue
+    return "\n\n".join(p for p in partes if p)
+
+
+# Lógica del chatbot: envía la pregunta al servidor Node, que consulta a Gemini
+def responder(historial, pregunta, idioma="es", contexto=""):
+    en = idioma == "en"
+    # El servidor guarda el historial por sessionId, por eso no se reenvía `historial`.
+    sesion = st.session_state.setdefault("sapy_session_id", str(uuid4()))
+    peticion = urllib.request.Request(
+        CHATBOT_URL,
+        data=json.dumps({"message": pregunta, "sessionId": sesion, "context": contexto,
+                         "language": idioma}).encode("utf-8"),
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(peticion, timeout=CHATBOT_TIMEOUT) as r:
+            return json.load(r).get("reply") or ("I got an empty answer." if en else "No recibí una respuesta.")
+    except urllib.error.HTTPError as e:
+        try:
+            detalle = json.load(e).get("error", "")
+        except Exception:
+            detalle = ""
+        return f"⚠️ {detalle or (f'Server error ({e.code}).' if en else f'Error del servidor ({e.code}).')}"
+    except urllib.error.URLError:
+        return ("⚠️ I can't reach the chatbot server. Start it with `npm start` in `src/chatbot`."
+                if en else
+                "⚠️ No puedo conectarme al servidor del chatbot. Inícialo con `npm start` en `src/chatbot`.")
+    except TimeoutError:
+        return "⚠️ The request took too long. Try again." if en else "⚠️ La solicitud tardó demasiado. Intenta de nuevo."
+
+
 # Interfaz: botón flotante en la esquina y panel de chat
-# ---------------------------------------------------------------------------
 def _css(avatar_b64, tr):
     st.html(f"""
 <style>
@@ -100,10 +292,12 @@ ESPERA_CIERRE = 45      # segundos sin preguntar antes de "¿Es todo o necesitas
 REVISION_CIERRE = 5     # cada cuánto se revisa (solo mientras el chat está abierto)
 
 
-def mostrar_sapy(idioma, tr):
-    """Dibuja el botón flotante; al pulsarlo abre el chat. tr(es, en) elige el texto según el idioma."""
+def mostrar_sapy(idioma, tr, datos):
+    """Dibuja el botón flotante; al pulsarlo abre el chat. tr(es, en) elige el texto según el idioma.
+    datos: lo que el dashboard está mostrando (ver construir_contexto); Sapy responde con eso."""
     if not AVATAR.exists():
         return
+    contexto = construir_contexto(datos)
     avatar_b64 = base64.b64encode(AVATAR.read_bytes()).decode()
     _css(avatar_b64, tr)
     st.session_state.setdefault("sapy_historial", [])
@@ -117,6 +311,7 @@ def mostrar_sapy(idioma, tr):
 
     def _limpiar():
         st.session_state["sapy_historial"] = []
+        st.session_state.pop("sapy_session_id", None)     # conversación nueva también en el servidor
 
     @st.dialog("Sapy", width="medium")
     def panel():
@@ -170,7 +365,7 @@ def mostrar_sapy(idioma, tr):
                         st.markdown(pregunta)
                     with st.chat_message("assistant", avatar=av):
                         with st.spinner(tr("Sapy está pensando…", "Sapy is thinking…")):
-                            texto = responder([m for m in hist if not m.get("fin")], pregunta, idioma)
+                            texto = responder([m for m in hist if not m.get("fin")], pregunta, idioma, contexto)
                         st.markdown(texto)
                 hist = hist + [{"rol": "user", "texto": pregunta}, {"rol": "assistant", "texto": texto}]
                 st.session_state["sapy_historial"] = hist[-40:]      # lo que se ve; al modelo van menos
@@ -182,8 +377,8 @@ def mostrar_sapy(idioma, tr):
 
     @st.fragment(run_every=f"{REVISION_CIERRE}s")
     def cierre():
-        """Pregunta de cierre: solo aparece si pasan ESPERA_CIERRE segundos sin otra pregunta.
-        Así no interrumpe una conversación fluida. No se guarda en el historial."""
+       ## Pregunta de cierre: solo aparece si pasan ESPERA_CIERRE segundos sin otra pregunta.
+        ## Así no interrumpe una conversación fluida. No se guarda en el historial.
         hist = st.session_state["sapy_historial"]
         ultimo = hist[-1] if hist else None
         quieto = time.time() - st.session_state.get("sapy_ultima_resp", time.time()) >= ESPERA_CIERRE

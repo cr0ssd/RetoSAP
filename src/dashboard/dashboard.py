@@ -1987,9 +1987,14 @@ pg = st.navigation([pg_resumen, pg_eventos, pg_tipos, pg_postmortems, pg_modelo,
 
 
 # --- Sapy (asistente). Solo la interfaz; la lógica del chatbot va en responder() de sapy.py.
-#     Para quitarlo: borra este bloque hasta "fin Sapy". -----------------------------------------
-from sapy import mostrar_sapy   # noqa: E402
-mostrar_sapy(IDIOMA, tr)
+from sapy import mostrar_sapy   
+_tipos_sapy = TIPOS_POSIBLES[STREAM] + sorted({t for sg in FIRMA[STREAM].values() for t in sg}
+                                              - set(TIPOS_POSIBLES[STREAM]))
+mostrar_sapy(IDIOMA, tr, dict(
+    mes=MES.replace("_", "-"), origen=STREAMS[STREAM], intervalo=ETIQUETA[SIZE_S], periodo=TXT_PERIODO,
+    z_umbral=Z_UMBRAL, ventanas=WIN, eventos=EV, relevantes=REL, resumen=RES, resumen_s=RES_S,
+    validacion=VALID, postmortems=pm_all, nombre=nombre, tipo_txt=tipo_txt, tipos=_tipos_sapy,
+    descripcion_tipo=DESCRIPCION_TIPO, firma=FIRMA[STREAM]))
 # --- fin Sapy ---------------------------------------------------------------------------------
 
 pg.run()
