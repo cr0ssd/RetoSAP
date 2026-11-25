@@ -1,0 +1,19 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 805 256" role="img" aria-label="forestia">
+  <g transform="translate(-14, -4) scale(0.252)" fill="#1D2D3E">
+    <polygon points="500,70 750,230 250,230"/>
+    <circle cx="500" cy="327" r="41"/>
+    <path fill-rule="evenodd" d="
+      M 330 230 L 670 230 L 670 422 L 775 527 L 712 527 L 834 690 L 713 690 L 889 889
+      L 612 889 L 612 1003 L 542 1003 L 542 813 L 731 813 L 563 621 L 702 621 L 610 498
+      L 390 498 L 298 621 L 437 621 L 269 813 L 458 813 L 458 1003 L 388 1003 L 388 889
+      L 111 889 L 287 690 L 166 690 L 288 527 L 225 527 L 330 422 Z
+      M 390 230 L 390 422 L 610 422 L 610 230 Z
+    "/>
+  </g>
+  <text x="242" y="196"
+        font-family="'Helvetica Neue', Helvetica, Arial, sans-serif"
+        font-size="186"
+        font-weight="700"
+        letter-spacing="-4"
+        fill="#1D2D3E">forestia</text>
+</svg>
