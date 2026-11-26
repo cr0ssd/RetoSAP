@@ -1,3 +1,7 @@
+<p align="left">
+  <img src="src/dashboard/componentes/forestia_logo.svg" alt="forestia" width="240" />
+</p>
+
 # Forestia — SAP Cloud Observability & Anomaly Detection
 
 Plataforma end-to-end de observabilidad y seguridad (SOC) para la detección no supervisada de anomalías en logs de **SAP Cloud** (`system` y `llm`), triage forense automatizado con **Agente AI + Model Context Protocol (MCP)**, generación de dossiers **Postmortem en PDF**, envío transaccional por correo y visualización interactiva bilingüe (`ES`/`EN`) con asistente conversacional (**Sapy**).
