@@ -1,5 +1,9 @@
 <p align="left">
-  <img src="src/dashboard/componentes/forestia_logo.svg" alt="forestia" width="240" />
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="src/dashboard/componentes/forestia_logo_dark.png">
+    <source media="(prefers-color-scheme: light)" srcset="src/dashboard/componentes/forestia_logo.png">
+    <img src="src/dashboard/componentes/forestia_logo.png" alt="forestia" width="260">
+  </picture>
 </p>
 
 # Forestia — SAP Cloud Observability & Anomaly Detection
